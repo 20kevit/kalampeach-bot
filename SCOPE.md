@@ -23,6 +23,8 @@ This document prevents MVP scope creep.
 | On-demand report | Manager asks in natural language |
 | Reporting integrity | Deterministic totals from database; AI may summarize computed results |
 | AI provider | NVIDIA API through replaceable provider adapter |
+| Hosting target | Python application on cPanel shared hosting; WSGI webhook plus cron worker |
+| Agent handoff | Arena codes in GitHub; OpenCode later verifies and deploys on cPanel after approval |
 | Reliability | Idempotent Telegram processing, validation, safe retries, no guessed records |
 
 ## Explicitly not needed in MVP
