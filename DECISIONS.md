@@ -71,6 +71,39 @@ Arena may select a minimal Python framework and exact schema implementation if i
 
 SQLite is the preferred MVP database if supported reliably by the actual cPanel account. Keep it in a durable directory outside the public web root.
 
+## Implementation decisions made by Arena
+
+These were within the "Implementation decisions Arena may make" allowance and are the
+basis of the current code. They are reversible only with the same reasoning.
+
+| Topic | Decision and rationale |
+|---|---|
+| Python version | Target **3.9+**, developed and tested on **3.11.2**. Only standard-library features available in 3.9 are used (`zoneinfo`, `sqlite3`, `urllib`, `hmac`). |
+| Web framework | **None.** A single WSGI callable (`kalampeach/web/app.py`) is exposed by `passenger_wsgi.py`. No Flask/Django means nothing to install or version-conflict on shared hosting, and Passenger's documented contract is satisfied directly. |
+| HTTP client | `urllib.request` with an injectable transport. `requests` is deliberately not used (not guaranteed installed, adds a dependency). |
+| Database | SQLite in a private absolute path (`DATABASE_PATH`), WAL journal mode, `foreign_keys=ON`, 5 s busy timeout, short-lived connections, explicit `BEGIN IMMEDIATE` for writes. File permissions are tightened to `0600`. |
+| Money | `Decimal` parsed from text, stored as `TEXT`. Floats are rejected at the parser boundary; there is no float arithmetic anywhere in the money path. |
+| Unknown values | `NULL`, never `0`. A financial event without an amount or currency stays `pending_clarification` and is excluded from totals, with the count disclosed. |
+| Currency grouping | Currencies are grouped case-insensitively (`USD` and `usd` are the same bucket) while the first-seen label is displayed. Totals are never summed across currencies, and no difference is computed without both sales and expenses in the same currency. |
+| Timezone | `zoneinfo.ZoneInfo("Asia/Tehran")` (IANA data), timestamps stored as UTC `…Z` strings, business dates as `YYYY-MM-DD`. `Asia/Tehran` and `23:30` are fixed for the MVP and rejected otherwise in configuration. |
+| Webhook | Validates `X-Telegram-Bot-Api-Secret-Token` with `hmac.compare_digest`, rejects missing/oversized bodies, persists the raw update to `telegram_updates` keyed by `update_id`, then returns `200 ok`. No AI call in the request path. |
+| Worker | Cron-invoked `scripts/run_worker.py`. Leases + `BEGIN IMMEDIATE` claims make overlapping runs safe; work is bounded by batch size and elapsed seconds; retries use `min(60 * 2^(n-1), 1800)` with a max-attempt cap; expired leases are recovered. |
+| Health | `/health` returns `200` only when the database responds **and** the shipped schema version is applied; otherwise `503` with `status: degraded`. The web process never migrates. |
+| Authorization | Numeric Telegram IDs only, from configuration. Username/`@handle` is never used for authorization. The manager may record only if explicitly listed in `EMPLOYEE_TELEGRAM_IDS`. |
+| Clarification | One initial question plus at most one narrower follow-up, then the event stays `pending_clarification` and the employee is told it is still open. A permanently undeliverable question is not retried forever. |
+| Private-only answers | Confirmation, clarification answers/expiry, correction acknowledgements and unresolved-reply notices always go to the employee's private chat. The group receives nothing except the neutral setup hint when the bot has never been started by that employee. |
+| Reports | Deterministic text assembled by `services/reporting.py`; the AI may add a narrative paragraph only. A narrative containing any number not present in the computed facts, or profit language, is discarded and the deterministic template is sent. |
+| Report delivery | `report_deliveries.report_key` is UNIQUE (`daily:<manager>:<date>`, `ondemand:<id>`), chunks are recorded as they are sent, and a `failed_uncertain` send is never automatically resent. |
+| Backup/restore | `scripts/backup_db.py` takes an online, verified copy and prunes old ones; restore is a documented manual procedure. The script never overwrites the live database. |
+| Tests | Offline only: temporary SQLite file, scripted AI provider, recording Telegram client, controllable clock. No test can reach the network or the accounting system. |
+
+## Current status of the owner inputs and open questions
+
+The code is complete against the MVP scope; the table above and the questions below are
+still unresolved. Until they are answered the bot runs with unknown currency preserved
+(no default), the manager records only if allowlisted, and the daily report is sent at
+23:30 Asia/Tehran. These defaults are deliberately conservative and reversible.
+
 ## Open product/hosting questions
 
 These must be resolved before the affected behavior goes live:

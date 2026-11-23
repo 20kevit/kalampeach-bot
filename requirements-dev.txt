@@ -1,0 +1,2 @@
+# Development/CI-only dependencies. Never required at runtime.
+pytest==9.2.0

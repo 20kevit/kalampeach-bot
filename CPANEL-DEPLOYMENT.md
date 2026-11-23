@@ -30,7 +30,15 @@ OpenCode must verify each item on the real hosting plan before deployment. Do no
 - Return success promptly only after the update is durably stored.
 - Do not call NVIDIA or perform lengthy business processing inside the webhook request.
 
-The exact route and Passenger startup file may differ if cPanel's actual Python application setup requires it; document any deviation in `DECISIONS.md`.
+The implemented entry point is `passenger_wsgi.py`, which exposes `application` from
+`kalampeach/web/app.py`. The webhook path comes from `WEBHOOK_PUBLIC_URL` and must match the
+route Passenger forwards (default `/telegram/webhook`). `GET|HEAD /health` reports
+`schema_version` and `expected_schema_version`; it returns **503 `degraded`** until the
+shipped schema version is applied, so a premature public URL cannot silently serve an
+unmigrated database.
+
+The exact route and Passenger startup file may differ if cPanel's actual Python application
+setup requires it; document any deviation in `DECISIONS.md`.
 
 ### Background processing
 
@@ -65,6 +73,18 @@ Worker requirements:
 
 If the hosting provider does not allow one-minute cron, OpenCode must report the limitation and estimate the resulting processing/report delay before proposing an alternative. Do not silently switch to an always-on process.
 
+Worker CLI (all flags optional; defaults come from the environment):
+
+```bash
+python scripts/run_worker.py [--batch-size N] [--max-seconds S] [--skip-reports]
+```
+
+It prints one JSON summary line (for example
+`{"claimed": 0, "done": 0, "retried": 0, "failed": 0, "duplicates": 0, "reports": {...}, "schema_version": 1}`)
+and exits with status `0`. `--skip-reports` is useful while testing intake only. The worker
+also applies pending migrations on its first run, so cron alone can bring a fresh
+installation up to date; `/health` becomes `200` once that has happened.
+
 ## 4. Database and filesystem
 
 SQLite is the preferred MVP database only if the actual host supports it reliably.
@@ -78,6 +98,32 @@ SQLite is the preferred MVP database only if the actual host supports it reliabl
 - Keep backups outside the web root and restrict file permissions.
 
 If SQLite locking or filesystem semantics are unsuitable on the actual account, stop and report the evidence. Propose the smallest supported relational database option available in that cPanel plan; do not introduce a new hosted service without owner approval.
+
+Implemented commands (paths are placeholders for the real account):
+
+```bash
+python scripts/migrate.py --status     # 001 initial_schema   PENDING | applied
+python scripts/migrate.py --dry-run    # show what would run
+python scripts/migrate.py --apply      # apply pending migrations (never drops data)
+python scripts/doctor.py [--env-file /home/CPANEL_USER/kalampeach/.env]
+python scripts/backup_db.py --output /home/CPANEL_USER/backups --keep 14
+```
+
+`migrate.py` refuses to continue if an already-applied migration file changed its checksum.
+`doctor.py` is read-only (no webhook, cron, Telegram or NVIDIA call) and masks secret values.
+`backup_db.py` writes a verified copy with mode `0600`, refuses any output path inside
+`public_html`, and never overwrites the live database. Restore procedure:
+
+1. Disable the cron job.
+2. Copy the chosen `kalampeach_bot_<timestamp>.sqlite3` over `DATABASE_PATH`
+   (keep the replaced file until verification succeeds).
+3. Run `python scripts/migrate.py --status` and `python scripts/doctor.py`.
+4. Re-enable cron and confirm `/health` returns `200`.
+
+Verified in this repository against a throwaway database: `--status` → `PENDING`,
+`--apply` → `applied 001 initial_schema`, `doctor.py` → `Result: 0 failure(s), 0 warning(s)`,
+`backup_db.py` → `backup_created … integrity=ok` with `-rw-------`. None of this has been
+run on a cPanel host.
 
 ## 5. Secrets and environment
 
@@ -110,6 +156,18 @@ After the application is deployed to a public HTTPS URL and the owner approves:
 6. Verify webhook status and error logs.
 
 Webhook registration is a live external change. Arena must not perform it. OpenCode must wait for owner approval.
+
+The repository ships `scripts/telegram_webhook.py` for this, which requires an explicit
+confirmation flag because it changes live state:
+
+```bash
+python scripts/telegram_webhook.py info
+python scripts/telegram_webhook.py set --yes      # sets WEBHOOK_PUBLIC_URL + secret
+python scripts/telegram_webhook.py delete --yes
+```
+
+`info` only calls `getWebhookInfo`. `set` sends `allowed_updates=["message"]` and the
+configured secret token. This script has **not** been executed from this repository.
 
 ## 7. cPanel-specific OpenCode inspection checklist
 
@@ -146,7 +204,21 @@ Only after owner approval:
 13. Verify backup and restore.
 14. Provide an operational handover with commands, paths, logs, limitations, and recovery steps.
 
-## 9. Explicit non-goals
+## 9. Verification status: repository vs host
+
+| Check | Repository (executed) | cPanel host (OpenCode) |
+|---|---|---|
+| Offline test suite | `python3 -m pytest` → 249 passed | must reproduce on the account's Python |
+| Passenger entry point | smoke-tested via `wsgiref` with a temp DB (health, signed update) | create the Python app and confirm the real URL |
+| Migrations | `--status/--apply/--status` executed on a temp DB | run against `DATABASE_PATH` after backup |
+| Doctor | `0 failure(s), 0 warning(s)` with a private env file | run with the account's real values |
+| Worker | empty-queue run exits `0` with JSON summary | configure cron, confirm one-minute interval |
+| Backup | verified copy + restore rehearsal on temp files | confirm destination, retention, permissions |
+| Webhook registration | **not executed** | owner-approved `set --yes` |
+| Real Telegram/NVIDIA traffic | **never** | controlled test accounts after approval |
+| 23:30 report in production | simulated in tests only | observe one real evening after approval |
+
+## 10. Explicit non-goals
 
 Do not require:
 - VPS/root access.

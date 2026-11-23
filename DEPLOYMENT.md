@@ -24,6 +24,24 @@ Do not invent values. Startup must validate required settings and fail with a cl
 - cPanel Cron Jobs to process updates and scheduled reports.
 - No long polling, persistent daemon, systemd, Docker, Redis, or root access assumed.
 
+Implemented stack: **no web framework** — a standard-library WSGI callable in
+`kalampeach/web/app.py` exposed by `passenger_wsgi.py`; `sqlite3` for storage; `urllib` for
+Telegram/NVIDIA HTTPS; `zoneinfo` for Asia/Tehran. Runtime dependencies are intentionally
+none (`requirements.txt` is empty), so the cPanel Python application only needs the
+interpreter and its standard library. Development uses `pytest` only. Rationale and
+minimum version are recorded in `DECISIONS.md`.
+
+Operational entry points:
+
+| Task | Command |
+|---|---|
+| Web | Passenger serves `passenger_wsgi.py` (`/telegram/webhook`, `/health`) |
+| Queue/report processing | `python scripts/run_worker.py` (cron, once per minute) |
+| Schema | `python scripts/migrate.py --status|--apply` |
+| Diagnostics | `python scripts/doctor.py` |
+| Backup | `python scripts/backup_db.py --output <private dir>` |
+| Webhook registration | `python scripts/telegram_webhook.py info|set --yes|delete --yes` |
+
 See `CPANEL-DEPLOYMENT.md` for the exact target model and later OpenCode handoff.
 
 ## 3. Timezone

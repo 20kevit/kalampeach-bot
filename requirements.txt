@@ -1,0 +1,17 @@
+# Runtime dependencies for the KalamPeach Telegram operations bot.
+#
+# Intentionally empty: the application uses only the Python standard library
+# (wsgiref-compatible WSGI callable, sqlite3, urllib, zoneinfo).
+#
+# No Flask, Django, requests, Celery, Redis, APScheduler, or ORM is required.
+# This keeps cPanel shared-hosting installs simple and avoids third-party
+# version conflicts in the account's virtual environment.
+#
+# Minimum Python: 3.9 (target and locally exercised on 3.11).
+# See DECISIONS.md for the rationale.
+#
+# Optional, only if the host's Python cannot load the IANA timezone database
+# (Asia/Tehran) from /usr/share/zoneinfo:
+#   tzdata==2024.1
+# Do not add it unless CPANEL-DEPLOYMENT.md section "Timezone data" shows it is
+# actually required on the account.

@@ -58,6 +58,84 @@ The deployment must provide Telegram bot credentials, the authorized group ID, m
 
 Every employee must open the bot and press **Start** once before the bot can send them private clarification messages. The bot must be configured to receive ordinary group messages; see [TELEGRAM-SETUP.md](TELEGRAM-SETUP.md).
 
+## Repository layout
+
+```
+passenger_wsgi.py              Passenger WSGI entry point (exposes `application`)
+kalampeach/
+  config.py                    Environment/.env loading + strict validation
+  db.py                        SQLite wrapper (WAL, FK on, short-lived connections)
+  migrations/                   Versioned SQL migrations + safe runner
+  repository.py               All SQL (parameterized only)
+  timeutil.py, decimal_utils.py, logging_utils.py
+  ai/                          Provider contract, JSON schema validation, NVIDIA adapter
+  telegram/                    Update parsing, Bot API client, chunking
+  services/                    auth, capture, corrections, clarification, reporting,
+                               reports (daily + on-demand), processor, worker
+  web/app.py                   Dependency-free WSGI webhook + /health
+scripts/
+  run_worker.py                Cron: one bounded, idempotent worker run
+  migrate.py                   --status / --dry-run / --apply
+  doctor.py                    Read-only configuration + storage check
+  backup_db.py                 Online SQLite backup with integrity check
+  telegram_webhook.py          setWebhook / getWebhookInfo / deleteWebhook (never run here)
+tests/                         Offline pytest suite (fake AI, fake Telegram, temp DB)
+```
+
+## Running locally (no deployment)
+
+```bash
+python3 -m pip install -r requirements-dev.txt    # pytest only
+python3 -m pytest                                  # offline suite
+```
+
+The suite never contacts Telegram, NVIDIA, cPanel or the accounting website. It uses a
+temporary SQLite database, a scripted AI provider, a recording Telegram client and a
+controllable clock.
+
+To exercise the operational scripts against a throwaway database (requires a private
+environment file or exported variables such as those in `.env.example`):
+
+```bash
+export DATABASE_PATH=/tmp/kalampeach-demo/private/kalampeach_bot.sqlite3
+python3 scripts/migrate.py --status     # 001 initial_schema   PENDING
+python3 scripts/migrate.py --apply      # applied 001 initial_schema
+python3 scripts/doctor.py               # read-only PASS/FAIL report
+python3 scripts/run_worker.py           # one bounded cron-equivalent run
+python3 scripts/backup_db.py --output /tmp/kalampeach-demo/backups
+```
+
+`/health` returns `200` only when the database is reachable **and** the shipped schema
+version is applied; otherwise it returns `503` with `status: degraded`, so a web
+request never serves traffic against an unmigrated database.
+
+## Required configuration
+
+All keys are required unless marked optional in [.env.example](.env.example). Values
+that only the owner can supply are listed in [DECISIONS.md](DECISIONS.md).
+
+| Key | Purpose |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | BotFather token (secret) |
+| `TELEGRAM_GROUP_ID`, `MANAGER_TELEGRAM_ID`, `EMPLOYEE_TELEGRAM_IDS` | Numeric-ID authorization |
+| `TELEGRAM_WEBHOOK_SECRET`, `WEBHOOK_PUBLIC_URL` | Webhook authentication and route |
+| `NVIDIA_API_KEY`, `NVIDIA_BASE_URL`, `NVIDIA_MODEL` | AI provider (no defaults are invented) |
+| `BUSINESS_TIMEZONE` (`Asia/Tehran`), `DAILY_REPORT_TIME` (`23:30`) | Business calendar |
+| `DEFAULT_CURRENCY` (optional, empty by default) | Only if the owner wants a default currency |
+| `DATABASE_PATH` | Absolute path outside `public_html` |
+| `LOG_LEVEL`, optional `ENV_FILE`, worker limits | Operations |
+
 ## Project status
 
-Requirements and implementation guidance are documented. Arena.ai is responsible for writing the Python application, tests, and deployment documentation in GitHub. OpenCode will later inspect the actual cPanel plan, verify compatibility, and deploy only after owner approval. See [ROADMAP.md](ROADMAP.md) for the separated build and operations stages.
+- Application code, migrations, operational scripts, tests and this documentation are
+  complete for the MVP scope in `SCOPE.md`.
+- Automated tests exist for every automated section of [TEST-PLAN.md](TEST-PLAN.md)
+  (A–G). Section H (human acceptance with real Telegram accounts) has **not** been
+  performed, because Arena must not deploy, register a webhook, configure cron or message
+  real users.
+- Nothing has been deployed, migrated on a real host, or exercised against live Telegram
+  or NVIDIA endpoints. Exact locally executed commands and results are recorded in
+  [CHANGELOG.md](CHANGELOG.md) and must be reproduced by OpenCode on the account.
+- OpenCode's remaining work: cPanel inspection, dependency/runtime verification,
+  configuration, migration, webhook registration, cron setup, and the human acceptance
+  test. See [CPANEL-DEPLOYMENT.md](CPANEL-DEPLOYMENT.md).
