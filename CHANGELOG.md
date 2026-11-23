@@ -4,10 +4,15 @@ All notable project changes are recorded here. The project has not yet had an ap
 
 ## [Unreleased]
 
+### Changed
+- Confirmed that Arena.ai is limited to code, tests, and documentation changes through GitHub.
+- Assigned later cPanel environment inspection, deployment, runtime verification, and operation to OpenCode after owner approval.
+- Set the deployment target to Python on shared hosting managed through cPanel.
+- Replaced the assumed long-running bot/scheduler model with HTTPS Telegram webhook, durable database inbox, and cPanel cron-invoked worker.
+
 ### Added
-- Initial standalone product and implementation documentation pack.
-- Confirmed daily manager report schedule: 23:30 Asia/Tehran.
-- Agent operating rules, product scope, architecture, data model, AI contract, security, Telegram setup, reporting, deployment, roadmap, and acceptance test plan.
+- cPanel deployment compatibility requirements and OpenCode handoff guidance.
+- Webhook secret validation, durable update queue, cron overlap, and restart-recovery acceptance criteria.
 
 ### Not yet implemented
 - Telegram bot runtime and handlers.
@@ -15,4 +20,4 @@ All notable project changes are recorded here. The project has not yet had an ap
 - Database schema and migrations.
 - Event extraction, clarification, and correction workflows.
 - Daily and on-demand report generation.
-- Automated test suite and deployment packaging.
+- Automated test suite and cPanel deployment packaging.
