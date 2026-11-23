@@ -40,6 +40,7 @@ An independent Telegram bot for capturing Kalam Pich business activity from one 
 | [REPORTING.md](REPORTING.md) | Daily and on-demand report rules |
 | [TEST-PLAN.md](TEST-PLAN.md) | Acceptance criteria and required tests |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Configuration, startup, operations, and backup expectations |
+| [CPANEL-DEPLOYMENT.md](CPANEL-DEPLOYMENT.md) | cPanel shared hosting target and OpenCode deployment handoff |
 | [ROADMAP.md](ROADMAP.md) | Delivery stages and future possibilities |
 | [CHANGELOG.md](CHANGELOG.md) | User-visible project changes |
 | [DECISIONS.md](DECISIONS.md) | Confirmed decisions and unresolved configuration |
@@ -53,4 +54,4 @@ Every employee must open the bot and press **Start** once before the bot can sen
 
 ## Project status
 
-Requirements and implementation guidance are documented. The repository does not yet contain an application implementation. See [ROADMAP.md](ROADMAP.md) for the intended build sequence.
+Requirements and implementation guidance are documented. Arena.ai is responsible for writing the Python application, tests, and deployment documentation in GitHub. OpenCode will later inspect the actual cPanel plan, verify compatibility, and deploy only after owner approval. See [ROADMAP.md](ROADMAP.md) for the separated build and operations stages.
