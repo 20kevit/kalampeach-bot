@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import pytest
 
 from kalampeach.ai.types import AIUnavailable
+from kalampeach import repository
 from kalampeach.services import messages, reporting
+from kalampeach.timeutil import to_utc_iso
 from kalampeach.services.reports import ReportService
 from kalampeach.telegram.client import TelegramError, chunk_text
 from conftest import (
@@ -110,18 +112,28 @@ def test_missed_due_time_is_recovered_once_inside_the_window(ctx, fake_telegram)
     assert messages.LATE_REPORT_NOTE in text
 
 
-def test_missed_day_outside_the_window_is_recorded_as_skipped(ctx):
+def test_multi_day_outage_is_recorded_once_per_day_and_never_sent_late(ctx):
     seed_event(ctx, 1, amount="1000", event_date="2026-11-23")
-    at(ctx, "2026-11-25T12:00:00Z")  # yesterday's window is long gone
+    at(ctx, "2026-11-26T12:00:00Z")  # three missed ticks, today's not due yet
 
     reports_now(ctx)
+
     rows = deliveries(ctx)
-    assert [row["status"] for row in rows] == ["skipped"]
-    assert rows[0]["period_start_date"] == "2026-11-24"
-    # Nothing is sent for a day the bot was not running.
+    assert sorted(row["period_start_date"] for row in rows) == [
+        "2026-11-23",
+        "2026-11-24",
+        "2026-11-25",
+    ]
+    assert {row["status"] for row in rows} == {"skipped"}
     assert fetch_one(
         ctx, "SELECT COUNT(*) AS total FROM report_deliveries WHERE status='sent'"
     )["total"] == 0
+
+    # A second run must not duplicate the audit rows.
+    ctx.clock.advance(minutes=1)
+    reports_now(ctx)
+    assert len(deliveries(ctx)) == 3
+
 
 
 def test_fresh_install_does_not_report_a_missed_day(ctx):
@@ -178,19 +190,23 @@ def test_transient_send_failure_is_retried_then_completed(ctx, fake_telegram):
     assert len(fake_telegram.texts_to(MANAGER_ID)) == 1
 
 
-def test_uncertain_delivery_is_never_resent(ctx, fake_telegram):
+def test_uncertain_delivery_is_never_resent_and_tells_the_manager(ctx, fake_telegram):
     seed_event(ctx, 1, amount="1000")
     fake_telegram.queue_failure(TelegramError("timeout", uncertain=True))
     at(ctx, "2026-11-23T20:00:05Z")
 
     reports_now(ctx)
     assert deliveries(ctx)[0]["status"] == "failed_uncertain"
+    assert deliveries(ctx)[0]["last_error_category"] == "timeout"
+    assert messages.REPORT_DELIVERY_UNKNOWN in fake_telegram.texts_to(MANAGER_ID)
 
     at(ctx, "2026-11-23T21:00:00Z")
     summary = reports_now(ctx)
     # Terminal status: it is no longer selected for delivery, so nothing is resent.
     assert summary["deliveries"] == {}
-    assert len(fake_telegram.attempts) == 1
+    assert len(fake_telegram.texts_to(MANAGER_ID)) == 1, "one notice, no report chunk"
+    chunk_attempts = [item for item in fake_telegram.attempts if "گزارش روزانه" in item["text"]]
+    assert len(chunk_attempts) == 1, "the chunk with an unknown outcome is attempted only once"
 
 
 def test_resend_resumes_after_the_last_confirmed_chunk(ctx, fake_telegram):
@@ -382,3 +398,46 @@ def test_report_text_respects_chunk_limit():
     assert len(chunks) > 1
     assert all(0 < len(chunk) <= 4096 for chunk in chunks)
     assert "".join(chunk.replace("\n", "") for chunk in chunks) == text.replace("\n", "").strip()[: len(text.replace("\n", "").strip())]
+
+
+def test_one_broken_delivery_does_not_starve_the_queue(ctx, monkeypatch):
+    """A delivery that raises must not block the ones behind it."""
+
+    service = ReportService(ctx)
+    seed_event(ctx, 1, amount="1000")
+    want = datetime(2026, 11, 23, 12, 0, tzinfo=timezone.utc)  # before the daily tick
+    ctx.clock.set(want)
+
+    ids = []
+    with ctx.db.transaction() as connection:
+        for number in (1, 2):
+            row, _ = repository.ensure_report_delivery(
+                connection,
+                report_key="ondemand:%d" % number,
+                report_type="on_demand",
+                variant="summary",
+                manager_telegram_user_id=MANAGER_ID,
+                period_start_date="2026-11-23",
+                period_end_date="2026-11-23",
+                scheduled_at_utc=to_utc_iso(want),
+                now=to_utc_iso(want),
+            )
+            ids.append(int(row["id"]))
+
+    real_deliver = ReportService._deliver
+    broken = {"used": False}
+
+    def flaky(self, delivery_id, moment):
+        if not broken["used"]:
+            broken["used"] = True
+            raise RuntimeError("boom")
+        return real_deliver(self, delivery_id, moment)
+
+    monkeypatch.setattr(ReportService, "_deliver", flaky)
+    summary = service.run_due(want)
+
+    assert summary["deliveries"] == {"errored": 1, "sent": 1}
+    with ctx.db.connection() as connection:
+        statuses = dict(connection.execute("SELECT id, status FROM report_deliveries"))
+    assert statuses[ids[0]] == "pending", "the broken row stays due for the next run"
+    assert statuses[ids[1]] == "sent"
