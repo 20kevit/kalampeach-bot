@@ -16,6 +16,25 @@ An independent Telegram bot for capturing Kalam Pich business activity from one 
 - Sends a daily report to the manager at **23:30 Asia/Tehran**.
 - Lets the manager request reports in natural language at any time.
 
+### Delivery guarantees (schema version 2)
+
+These are the rules the code enforces, each covered by an offline test:
+
+- A clarification question is claimed in the database *before* Telegram is called, so
+  overlapping cron runs send it at most once.
+- A send whose outcome is unknown (timeout, connection reset, process killed mid-call)
+  is recorded as `delivery_uncertain`: it is never resent automatically, it stays
+  answerable by reply, and it is counted in `/health` → `review_needed` for an operator.
+- A report is frozen in `snapshot_json` before its first chunk is sent. A retry resumes
+  at the first unconfirmed chunk, never repeats a confirmed chunk, and never rebuilds
+  the content — so a report cannot change between retries.
+- A partially delivered report whose outcome cannot be proven stops as
+  `failed_uncertain` with a single notice to the manager. No silent duplication.
+- A missed daily tick is recovered once inside the recovery window; older missed days
+  are recorded as `skipped` and are never sent late.
+- A cron run that loses its lease cannot overwrite the run that took over, and a failing
+  phase does not stop the other phases (it makes the run exit non-zero).
+
 ## MVP principles
 
 - One Telegram bot, one configured group, one independent database.
@@ -49,6 +68,7 @@ An independent Telegram bot for capturing Kalam Pich business activity from one 
 | [CPANEL-DEPLOYMENT.md](CPANEL-DEPLOYMENT.md) | cPanel shared hosting target and OpenCode deployment handoff |
 | [ROADMAP.md](ROADMAP.md) | Delivery stages and future possibilities |
 | [CHANGELOG.md](CHANGELOG.md) | User-visible project changes |
+| [OPENCODE-HANDOFF.md](OPENCODE-HANDOFF.md) | What is done, what needs cPanel/owner input, and the exact command list |
 | [DECISIONS.md](DECISIONS.md) | Confirmed decisions and unresolved configuration |
 | [ARENA-PROMPT.md](ARENA-PROMPT.md) | End-to-end implementation brief for Arena.ai |
 
@@ -98,8 +118,8 @@ environment file or exported variables such as those in `.env.example`):
 
 ```bash
 export DATABASE_PATH=/tmp/kalampeach-demo/private/kalampeach_bot.sqlite3
-python3 scripts/migrate.py --status     # 001 initial_schema   PENDING
-python3 scripts/migrate.py --apply      # applied 001 initial_schema
+python3 scripts/migrate.py --status     # 001 initial_schema PENDING, 002 … PENDING
+python3 scripts/migrate.py --apply      # applied 001 …, applied 002 …
 python3 scripts/doctor.py               # read-only PASS/FAIL report
 python3 scripts/run_worker.py           # one bounded cron-equivalent run
 python3 scripts/backup_db.py --output /tmp/kalampeach-demo/backups
@@ -107,7 +127,12 @@ python3 scripts/backup_db.py --output /tmp/kalampeach-demo/backups
 
 `/health` returns `200` only when the database is reachable **and** the shipped schema
 version is applied; otherwise it returns `503` with `status: degraded`, so a web
-request never serves traffic against an unmigrated database.
+request never serves traffic against an unmigrated database. The healthy body also
+carries `review_needed` (counts of clarifications and report deliveries whose outcome is
+unknown) — it is a number only, never message content.
+
+`scripts/run_worker.py` exits `0` on a clean run and `1` when a phase failed during that
+run; the JSON summary is printed either way so cPanel cron mail shows the reason.
 
 ## Required configuration
 
@@ -130,9 +155,12 @@ that only the owner can supply are listed in [DECISIONS.md](DECISIONS.md).
 - Application code, migrations, operational scripts, tests and this documentation are
   complete for the MVP scope in `SCOPE.md`.
 - Automated tests exist for every automated section of [TEST-PLAN.md](TEST-PLAN.md)
-  (A–G). Section H (human acceptance with real Telegram accounts) has **not** been
-  performed, because Arena must not deploy, register a webhook, configure cron or message
-  real users.
+  (A–G): 295 offline tests, `python3 -m pytest`. Section H (human acceptance with real
+  Telegram accounts) has **not** been performed, because Arena must not deploy, register
+  a webhook, configure cron or message real users.
+- The second pass (schema version 2) verified and fixed the delivery-integrity defects
+  listed in [CHANGELOG.md](CHANGELOG.md); the remaining known limitations are listed in
+  [OPENCODE-HANDOFF.md](OPENCODE-HANDOFF.md).
 - Nothing has been deployed, migrated on a real host, or exercised against live Telegram
   or NVIDIA endpoints. Exact locally executed commands and results are recorded in
   [CHANGELOG.md](CHANGELOG.md) and must be reproduced by OpenCode on the account.

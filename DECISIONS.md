@@ -96,6 +96,25 @@ basis of the current code. They are reversible only with the same reasoning.
 | Report delivery | `report_deliveries.report_key` is UNIQUE (`daily:<manager>:<date>`, `ondemand:<id>`), chunks are recorded as they are sent, and a `failed_uncertain` send is never automatically resent. |
 | Backup/restore | `scripts/backup_db.py` takes an online, verified copy and prunes old ones; restore is a documented manual procedure. The script never overwrites the live database. |
 | Tests | Offline only: temporary SQLite file, scripted AI provider, recording Telegram client, controllable clock. No test can reach the network or the accounting system. |
+| Schema versioning | Forward-only SQL files, SHA-256 checksummed, applied inside one `BEGIN IMMEDIATE` transaction each; a modified already-applied file is a hard error. Schema version 2 adds the clarification delivery states. |
+| Clarification delivery | `pending_delivery → sending → awaiting_answer`, with `lease_owner`/`lease_expires_at_utc`. `delivery_uncertain` and a stale `sending` row are terminal for automatic sending but still answerable; only a definitely-unsent outcome is retried (`min(300 * attempts, 1800)` s). |
+| Report delivery | The rendered text is frozen in `snapshot_json` before the first chunk; `chunks_sent` advances per confirmed chunk; a resumed delivery never repeats a chunk and never rebuilds content; an unprovable outcome is `failed_uncertain` with one manager notice. |
+| Missed daily reports | A bounded 30-day scan records each missed day once as `skipped` (for operator visibility) and sends only the newest day that is still inside `DAILY_REPORT_RECOVERY_HOURS`. A stale daily report is never delivered late. |
+| Worker failure isolation | Intake, clarification and report phases each run in their own guard; a failure is logged, recorded in `phase_failures`, and makes the cron run exit non-zero, but does not stop the other phases. |
+| Delivery review surface | `/health` → `review_needed` and `scripts/doctor.py` → `delivery_review_needed` count deliveries whose outcome is unknown. They expose counts only, never message text or IDs. |
+| Python minimum enforcement | `requires-python = ">=3.9"` is checked by tests: every shipped file must parse with `feature_version=(3, 9)` and must not use 3.10+/3.11+ stdlib APIs (`tomllib`, `datetime.UTC`, `StrEnum`, `TaskGroup`, `ExceptionGroup`, `typing.Self`). |
+
+## Second-pass decisions that need the owner's attention
+
+These are conservative defaults chosen because the owner has not answered yet. Each is a
+small, reversible change if the answer differs.
+
+| Topic | Current behavior | Owner decision needed |
+|---|---|---|
+| Unknown delivery outcome | Never resent automatically; counted in `review_needed`; a manager notice is sent for reports only. | Should the manager also be notified about each uncertain clarification question (more noise, faster awareness)? |
+| Manual resolution of an uncertain question | The employee can still answer it by reply; an operator can inspect counts via `/health`. There is no manual "force resend" command, by design. | Whether a documented, explicit operator command should exist at all. |
+| Stale daily reports | Older missed days are recorded as `skipped` and never sent. | Whether the manager would rather receive one consolidated "these days were missed" message. |
+| Retention of `skipped`/`failed_uncertain` rows | Kept indefinitely (audit value). | Retention period. |
 
 ## Current status of the owner inputs and open questions
 

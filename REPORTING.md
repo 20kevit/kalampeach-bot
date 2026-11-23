@@ -62,6 +62,20 @@ Use a unique report key based on report type, manager ID, and Tehran local repor
 
 Persist states such as pending, sending, sent, and failed. After restart, recover due reports without sending a second copy if Telegram already accepted the original message. Where Telegram response uncertainty prevents certainty, reconcile using stored delivery metadata and a conservative retry policy; do not blindly duplicate.
 
+Implemented behavior (schema version 2):
+
+- The rendered text is frozen in `snapshot_json` before the first chunk is sent. A retry
+  resumes at chunk `chunks_sent + 1` and always sends that frozen content, even if events
+  were edited after the freeze.
+- A delivery found in `sending` after a restart is resolved from its own progress:
+  all chunks confirmed → `sent`; nothing attempted → safe restart; some chunks in flight →
+  `failed_uncertain` with one notice to the manager, and no automatic resend.
+- A missing/corrupt snapshot with confirmed chunks is never rebuilt (that would resend
+  confirmed content); it stops for human review.
+- A missed 23:30 tick is recovered once inside `DAILY_REPORT_RECOVERY_HOURS`. Older missed
+  days are recorded as `skipped` for operator visibility and are never sent late.
+- `GET /health` → `review_needed` counts the deliveries whose outcome is unknown.
+
 ## 7. AI narrative
 
 AI receives only a precomputed fact payload. It may produce a concise Persian explanation and highlight notable recorded items. It may not recalculate totals, add unsupported numbers, or imply causation not present in the data.

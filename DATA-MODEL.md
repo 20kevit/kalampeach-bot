@@ -62,9 +62,19 @@ Never delete or overwrite prior revision rows.
 - ID and event ID.
 - Original employee Telegram ID.
 - Question text and missing field identifiers.
-- Status: open, answered, resolved, expired, unable_to_deliver.
+- Status (schema version 2, enforced by a CHECK constraint):
+  `pending_delivery`, `sending`, `awaiting_answer`, `answered`, `resolved`, `expired`,
+  `unable_to_deliver`, `delivery_uncertain`.
+- Delivery bookkeeping: `question_count`, `delivery_attempts`,
+  `next_delivery_attempt_at_utc`, `last_delivery_error`, `lease_owner`,
+  `lease_expires_at_utc`.
 - Prompt source message ID and response source message ID.
 - Created/resolved timestamps.
+
+Lifecycle: `pending_delivery` → (`sending` claim) → `awaiting_answer` on a confirmed send;
+a definitely-unsent failure returns to `pending_delivery` with backoff; a permanent
+rejection becomes `unable_to_deliver`; an unknown outcome (timeout, crash mid-send) becomes
+`delivery_uncertain`, which is never resent automatically but still accepts an answer.
 
 ### processed_updates
 If not represented directly by source_messages:
@@ -79,9 +89,11 @@ Avoid duplicate tables if source_messages already provides the required durable 
 - Report key (unique per report type, manager, and local date/period).
 - Report type and period start/end.
 - Manager Telegram ID.
-- Status: pending, sent, failed.
-- Computed data snapshot or reproducible query metadata.
-- Delivery message ID when successful.
+- Status: `pending`, `sending`, `sent`, `failed`, `failed_uncertain`, `skipped`.
+- Frozen content: `snapshot_json` holds the exact rendered text captured before the first
+  chunk is sent, so a retry can never change the content of a period.
+- Per-chunk progress: `chunk_count`, `chunks_sent`, `telegram_message_ids`.
+- Lease: `lease_owner`, `lease_expires_at_utc`.
 - Attempt count, last error category, timestamps.
 
 ## 2. Event payload rules

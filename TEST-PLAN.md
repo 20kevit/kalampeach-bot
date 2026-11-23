@@ -90,6 +90,43 @@ All mandatory criteria must pass before the MVP is considered complete. Arena mu
 - [ ] Startup fails clearly when required configuration is missing.
 - [ ] Logs identify failures without exposing full private message content or credentials.
 
+## I. Delivery integrity (added in the second pass)
+
+Every item here is automated and passes offline; the "verified defect" column names the
+behavior that was wrong before the fix.
+
+- [ ] Two overlapping workers send a private clarification question at most once. (A1)
+- [ ] A worker killed between the Telegram call and the bookkeeping does not cause a
+      second question when the next run happens. (A2)
+- [ ] A timeout / connection reset after the request was written is recorded as an
+      unknown outcome, never resent automatically, and stays answerable. (A3)
+- [ ] A stale `sending` claim is swept to an unknown outcome instead of being retried. (A2)
+- [ ] A live claim is respected: another worker skips it instead of stealing it.
+- [ ] A blocked bot / chat-not-found question becomes permanently undeliverable with one
+      neutral group hint and no business detail. (A4)
+- [ ] Every clarification event is created once, even when the same answer is processed
+      twice.
+- [ ] A report is frozen before the first chunk is sent; a resumed report never contains
+      data that changed after the freeze. (B2)
+- [ ] A crash after chunk *n* resumes at chunk *n+1* and never repeats 1..*n*. (B1)
+- [ ] A delivery interrupted in an unknown position stops as uncertain and notifies the
+      manager exactly once. (B1)
+- [ ] A lost or corrupt snapshot never causes confirmed chunks to be resent. (B2)
+- [ ] `chunks_sent > len(chunks)` stops for review instead of restarting. (B3)
+- [ ] A multi-day outage records one `skipped` row per missed day and never sends a stale
+      report. (B4)
+- [ ] One raising delivery does not starve the rest of the queue. (B5)
+- [ ] A worker that lost its lease cannot finish or requeue another run's update. (D1)
+- [ ] A failing phase does not stop the other phases and surfaces in the summary. (D2)
+- [ ] `/health` and `scripts/doctor.py` expose how many deliveries need human review,
+      without any content.
+- [ ] Migrations: a modified historical migration is rejected by checksum; five
+      concurrent `ensure_schema` calls apply each version once; a failing migration rolls
+      back; 001→002 keeps ids, timestamps and the id sequence; duplicate filenames are
+      refused. (D3)
+- [ ] The declared Python minimum (3.9) is enforced by parsing every shipped file with
+      `feature_version=(3, 9)` and by a 3.10+/3.11+ API denylist. (G1)
+
 ## H. Human acceptance test
 
 Using a controlled Telegram test group and test accounts after OpenCode has configured a test environment:
@@ -102,9 +139,28 @@ Using a controlled Telegram test group and test accounts after OpenCode has conf
 
 The owner reviews the results before production deployment.
 
+## Executable coverage map (second pass)
+
+| Section | Automated in | Notes |
+|---|---|---|
+| A. Authorization and routing | `test_authorization.py`, `test_capture_events.py` | Numeric IDs only. |
+| B. Webhook and durable queue | `test_webhook.py`, `test_outbox.py`, `test_worker.py` | Includes replay and lease-loss cases. |
+| C. Classification and extraction | `test_capture_events.py`, `test_ai_schema.py`, `test_nvidia_adapter.py` | Fake provider only. |
+| D. Clarification | `test_clarification.py`, `test_clarification_delivery.py` | Lifecycle, concurrency, crash, uncertainty. |
+| E. Corrections and audit | `test_corrections.py` | |
+| F. Reports | `test_reporting.py`, `test_reports.py`, `test_report_delivery_safety.py` | Frozen content, per-chunk resume, gap scan. |
+| G. cPanel and integrity | `test_integrity.py`, `test_migrations.py`, `test_config.py`, `test_decimal_time.py` | Local only; says nothing about the real account. |
+| I. Delivery integrity | `test_clarification_delivery.py`, `test_report_delivery_safety.py`, `test_migrations.py` | |
+| H. Human acceptance | — | Requires the owner's test group and a deployed instance. |
+
 ## Test evidence
 
-Arena must report which tests it authored and which it could not execute. OpenCode must later report:
+Arena reports (second pass, executed locally): `python3 -m pytest` →
+`295 passed in 6.56s` on Python 3.11.2 / SQLite 3.40.1. 250 of those tests existed at the
+start of the pass; 45 were added. Nothing in section H was executed. No test reached
+Telegram, NVIDIA, cPanel or the accounting system — every external call is a fake.
+
+OpenCode must later report:
 - Exact test commands.
 - Number of passed/failed/skipped tests.
 - Any manual tests and their observed results.
