@@ -41,7 +41,18 @@ This is required so the bot can privately ask that employee for clarification.
 - Do not publish IDs unnecessarily in public documentation.
 - Ensure the manager has started the bot privately to receive daily reports.
 
-## 5. Controlled test
+## 5. Webhook transport
+
+The production hosting target uses Telegram HTTPS webhooks, not long polling.
+
+- The Python WSGI application exposes the configured webhook route over public HTTPS.
+- The webhook validates Telegram's `X-Telegram-Bot-Api-Secret-Token` header.
+- Valid updates are durably stored before the endpoint acknowledges them.
+- AI extraction and report work are performed later by the cPanel cron worker, not inside the webhook request.
+- OpenCode registers or changes the live webhook only during the later deployment phase and only after owner approval. Arena must not configure a live webhook.
+- See `CPANEL-DEPLOYMENT.md` for deployment details.
+
+## 6. Controlled test
 
 Before production:
 - Send a normal text message in the group from an authorized employee.
