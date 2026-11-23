@@ -30,7 +30,7 @@ from ..ai.types import (
 from ..telegram.updates import UpdatePayloadError, normalize_update
 from ..timeutil import to_utc_iso
 from . import auth, messages
-from .capture import CaptureService
+from .capture import CaptureService, clarification_accepts_answer
 from .context import AppContext
 from .corrections import CorrectionService
 from .errors import (
@@ -230,12 +230,20 @@ class MessageProcessor:
             return "unresolved", None
 
     def _awaiting_clarification_for(self, event, message):
+        now_iso = self.ctx.now_iso()
         with self.ctx.db.connection() as connection:
             rows = repository.list_open_clarifications(connection, int(message.sender_id or 0))
-        for row in rows:
-            if int(row["event_id"]) == int(event["id"]) and row["status"] == "awaiting_answer":
-                return row
-        return None
+        candidates = [
+            row
+            for row in rows
+            if int(row["event_id"]) == int(event["id"])
+            and clarification_accepts_answer(row, now_iso)
+        ]
+        if not candidates:
+            return None
+        # Prefer a question the employee definitely received, then the newest.
+        candidates.sort(key=lambda row: (row["status"] != "awaiting_answer", -int(row["id"])))
+        return candidates[0]
 
     # ------------------------------------------------------------------
     def _handle_manager_private(self, *, message, source_id: int, decision) -> ServiceOutcome:

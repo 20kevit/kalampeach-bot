@@ -35,6 +35,24 @@ MAX_QUESTIONS_PER_CLARIFICATION = 2
 MAX_DELIVERY_ATTEMPTS = 3
 
 
+def clarification_accepts_answer(row, now_iso: str) -> bool:
+    """Can an incoming message be treated as the answer to this question?
+
+    ``delivery_uncertain`` rows are accepted on purpose: the employee may have
+    received the question without the bot being able to prove it, so requiring
+    ``awaiting_answer`` would strand the event forever. A ``sending`` row is only
+    answerable once its claim has gone stale (the sending worker is gone).
+    """
+
+    status = str(row["status"])
+    if status in ("awaiting_answer", "delivery_uncertain"):
+        return True
+    if status == "sending":
+        expiry = row["lease_expires_at_utc"]
+        return expiry is None or str(expiry) <= now_iso
+    return False
+
+
 class CaptureService:
     def __init__(self, ctx: AppContext, notifier: Optional[Notifier] = None) -> None:
         self.ctx = ctx
@@ -199,9 +217,25 @@ class CaptureService:
 
     # -- clarification delivery -------------------------------------------
     def deliver_pending_clarifications(self, now=None, *, limit: int = 5) -> dict:
+        """Deliver due questions. Independent of the Telegram inbox.
+
+        Each question is claimed (``pending_delivery`` -> ``sending``) *before*
+        Telegram is called, so overlapping cron runs cannot send the same
+        question twice, and a process killed mid-send leaves a durable trace
+        instead of an apparently untouched row.
+        """
+
         moment = now or self.ctx.now()
         now_iso = to_utc_iso(moment)
-        stats = {"sent": 0, "retry": 0, "unable": 0}
+        stats = {"sent": 0, "retry": 0, "unable": 0, "uncertain": 0, "skipped": 0}
+
+        with self.ctx.db.transaction() as connection:
+            stale = repository.expire_stale_clarification_deliveries(connection, now=now_iso)
+        for clarification_id in stale:
+            logger.error(
+                "clarification_delivery_uncertain clarification_id=%s category=lease_expired_during_send",
+                clarification_id,
+            )
 
         with self.ctx.db.connection() as connection:
             pending = repository.list_clarifications_for_delivery(
@@ -209,53 +243,65 @@ class CaptureService:
             )
 
         for row in pending:
-            outcome = self._deliver_one(row, moment)
+            outcome = self._deliver_one(int(row["id"]), moment)
             stats[outcome] = stats.get(outcome, 0) + 1
         return stats
 
-    def _deliver_one(self, row, moment) -> str:
-        clarification_id = int(row["id"])
+    def _deliver_one(self, clarification_id: int, moment) -> str:
+        now_iso = to_utc_iso(moment)
+        lease_seconds = int(self.ctx.settings.worker_lease_seconds)
+
+        with self.ctx.db.transaction() as connection:
+            claimed = repository.claim_clarification_for_delivery(
+                connection,
+                clarification_id=clarification_id,
+                now=now_iso,
+                lease_seconds=lease_seconds,
+                worker_id=self.ctx.worker_id,
+            )
+            if not claimed:
+                # Another run took it, or it stopped being due while we looked.
+                return "skipped"
+            row = repository.get_clarification(connection, clarification_id)
+        if row is None:  # pragma: no cover - defensive
+            return "skipped"
         employee_id = int(row["employee_telegram_user_id"])
+
         try:
             message_id = self.ctx.telegram.send_message(employee_id, row["question_text"])
         except TelegramError as exc:
-            attempts = int(row["delivery_attempts"]) + 1
-            if exc.retryable and attempts < MAX_DELIVERY_ATTEMPTS:
-                next_at = to_utc_iso(moment + timedelta(seconds=min(300 * attempts, 1800)))
-                self._mark_delivery_failure(clarification_id, exc.category, next_at)
-                logger.warning(
-                    "clarification_delivery_retry clarification_id=%s attempt=%d category=%s",
-                    clarification_id,
-                    attempts,
-                    exc.category,
-                )
-                return "retry"
-            self._mark_delivery_failure(clarification_id, exc.category, None)
-            self._send_setup_hint(int(row["event_id"]))
-            logger.warning(
-                "clarification_undeliverable clarification_id=%s category=%s",
-                clarification_id,
-                exc.category,
-            )
-            return "unable"
+            return self._handle_send_failure(row, exc, moment, claimed_attempts=int(row["delivery_attempts"]))
 
-        now_iso = to_utc_iso(moment)
-        with self.ctx.db.transaction() as connection:
-            repository.mark_clarification_delivered(
-                connection,
-                clarification_id=clarification_id,
-                now=now_iso,
-                question_count=int(row["question_count"]) + 1,
+        question_count = int(row["question_count"]) + 1
+        try:
+            with self.ctx.db.transaction() as connection:
+                changed = repository.mark_clarification_delivered(
+                    connection,
+                    clarification_id=clarification_id,
+                    now=now_iso,
+                    question_count=question_count,
+                    worker_id=self.ctx.worker_id,
+                )
+                if changed:
+                    repository.record_bot_message(
+                        connection,
+                        chat_id=employee_id,
+                        message_id=int(message_id),
+                        kind="clarification_prompt",
+                        event_id=int(row["event_id"]),
+                        clarification_id=clarification_id,
+                        now=now_iso,
+                    )
+        except Exception as exc:  # bookkeeping failed after a confirmed send
+            self._mark_uncertain_after_success(clarification_id, exc)
+            return "uncertain"
+
+        if not changed:  # pragma: no cover - claim lost between send and record
+            logger.error(
+                "clarification_delivery_claim_lost clarification_id=%s", clarification_id
             )
-            repository.record_bot_message(
-                connection,
-                chat_id=employee_id,
-                message_id=int(message_id),
-                kind="clarification_prompt",
-                event_id=int(row["event_id"]),
-                clarification_id=clarification_id,
-                now=now_iso,
-            )
+            return "uncertain"
+
         logger.info(
             "clarification_sent clarification_id=%s event_id=%s",
             clarification_id,
@@ -263,16 +309,87 @@ class CaptureService:
         )
         return "sent"
 
-    def _mark_delivery_failure(
-        self, clarification_id: int, category: str, next_attempt_at: Optional[str]
-    ) -> None:
+    def _handle_send_failure(self, row, exc: TelegramError, moment, *, claimed_attempts: int) -> str:
+        clarification_id = int(row["id"])
+        now_iso = to_utc_iso(moment)
+        worker_id = self.ctx.worker_id
+
+        if exc.uncertain:
+            # Telegram may have delivered this. Never resend; keep the question
+            # answerable so the employee can still complete it by reply.
+            with self.ctx.db.transaction() as connection:
+                repository.mark_clarification_delivery_uncertain(
+                    connection,
+                    clarification_id=clarification_id,
+                    error_category=exc.category,
+                    now=now_iso,
+                    worker_id=worker_id,
+                )
+            logger.error(
+                "clarification_delivery_uncertain clarification_id=%s category=%s",
+                clarification_id,
+                exc.category,
+            )
+            return "uncertain"
+
+        if exc.retryable and claimed_attempts < MAX_DELIVERY_ATTEMPTS:
+            next_at = to_utc_iso(moment + timedelta(seconds=min(300 * claimed_attempts, 1800)))
+            with self.ctx.db.transaction() as connection:
+                repository.release_clarification_for_retry(
+                    connection,
+                    clarification_id=clarification_id,
+                    error_category=exc.category,
+                    next_attempt_at=next_at,
+                    now=now_iso,
+                    worker_id=worker_id,
+                )
+            logger.warning(
+                "clarification_delivery_retry clarification_id=%s attempt=%d category=%s",
+                clarification_id,
+                claimed_attempts,
+                exc.category,
+            )
+            return "retry"
+
+        # Definitely not delivered (permanent rejection or attempts exhausted).
         with self.ctx.db.transaction() as connection:
-            repository.mark_clarification_delivery_failed(
+            repository.mark_clarification_undeliverable(
                 connection,
                 clarification_id=clarification_id,
-                error_category=category,
-                next_attempt_at=next_attempt_at,
-                now=self.ctx.now_iso(),
+                error_category=exc.category,
+                now=now_iso,
+                worker_id=worker_id,
+            )
+        self._send_setup_hint(int(row["event_id"]))
+        logger.warning(
+            "clarification_undeliverable clarification_id=%s category=%s attempts=%d",
+            clarification_id,
+            exc.category,
+            claimed_attempts,
+        )
+        return "unable"
+
+    def _mark_uncertain_after_success(self, clarification_id: int, exc: Exception) -> None:
+        """A confirmed send could not be recorded: treat the outcome as unknown."""
+
+        logger.error(
+            "clarification_delivery_uncertain clarification_id=%s category=bookkeeping_failed error=%s",
+            clarification_id,
+            exc.__class__.__name__,
+        )
+        try:
+            with self.ctx.db.transaction() as connection:
+                repository.mark_clarification_delivery_uncertain(
+                    connection,
+                    clarification_id=clarification_id,
+                    error_category="bookkeeping_failed",
+                    now=self.ctx.now_iso(),
+                )
+        except Exception as inner:  # pragma: no cover - database is down
+            logger.critical(
+                "clarification_state_write_failed clarification_id=%s error=%s",
+                clarification_id,
+                inner.__class__.__name__,
             )
 
     def _send_setup_hint(self, event_id: int) -> None:
@@ -296,7 +413,7 @@ class CaptureService:
     def handle_answer(self, *, message, source_message_id: int, clarification) -> ServiceOutcome:
         if int(clarification["employee_telegram_user_id"]) != int(message.sender_id or 0):
             return ServiceOutcome(action="ignored", note="answer_not_owner")
-        if clarification["status"] != "awaiting_answer":
+        if not clarification_accepts_answer(clarification, self.ctx.now_iso()):
             return ServiceOutcome(action="ignored", note="clarification_not_awaiting")
         if clarification["response_source_message_id"] == source_message_id:
             return ServiceOutcome(action="duplicate", clarification_id=int(clarification["id"]))
@@ -504,7 +621,8 @@ class CaptureService:
         rows = connection.execute(
             """
             SELECT id FROM clarifications
-             WHERE event_id = ? AND status IN ('pending_delivery', 'awaiting_answer')
+             WHERE event_id = ?
+               AND status IN ('pending_delivery', 'sending', 'awaiting_answer', 'delivery_uncertain')
             """,
             (event_id,),
         ).fetchall()

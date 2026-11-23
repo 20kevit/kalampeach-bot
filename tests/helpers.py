@@ -121,6 +121,156 @@ def bot_messages(ctx, kind: Optional[str] = None):
     return fetch_all(ctx, "SELECT * FROM bot_messages ORDER BY message_id")
 
 
+def seed_pending_clarification(
+    ctx,
+    *,
+    seq: int = 1,
+    employee_id: int = EMPLOYEE_ID,
+    question: str = "مبلغ این خرید چقدر بود؟",
+    missing=("amount",),
+    status: str = "pending_delivery",
+    lease_expires_at: Optional[str] = None,
+    chunk_hint: str = "خرید",
+):
+    """Create a pending event plus its clarification, as capture would leave it.
+
+    Returns ``(event_id, clarification_id)``. Used to exercise delivery in
+    isolation from the capture path.
+    """
+
+    now = to_utc_iso(ctx.now())
+    with ctx.db.transaction() as connection:
+        repository.upsert_user(
+            connection,
+            telegram_user_id=employee_id,
+            display_name="کارمند نمونه",
+            role="employee",
+            now=now,
+        )
+        source, _ = repository.record_source_message(
+            connection,
+            telegram_update_id=500000 + seq,
+            chat_id=GROUP_ID,
+            chat_type="group",
+            message_id=600000 + seq,
+            reply_to_message_id=None,
+            sender_telegram_user_id=employee_id,
+            message_text="seed pending %d" % seq,
+            message_timestamp_utc=now,
+            processing_status="pending",
+            now=now,
+        )
+        event_id = repository.insert_event(
+            connection,
+            event_type="expense_purchase",
+            status="pending_clarification",
+            event_date="2026-11-23",
+            amount=None,
+            currency="تومان",
+            currency_source="explicit",
+            item_name=None,
+            quantity=None,
+            unit=None,
+            inventory_direction=None,
+            description=chunk_hint,
+            created_by_telegram_user_id=employee_id,
+            source_message_id=int(source["id"]),
+            status_reason="missing_fields:" + ",".join(missing),
+            now=now,
+        )
+        repository.insert_revision(
+            connection,
+            event_id=int(event_id),
+            revision_number=1,
+            actor_telegram_user_id=employee_id,
+            change_type="created",
+            change_reason="pending_clarification",
+            source_message_id=int(source["id"]),
+            clarification_id=None,
+            previous_snapshot=None,
+            new_snapshot="{}",
+            validation_status="pending",
+            now=now,
+        )
+        clarification_id = repository.insert_clarification(
+            connection,
+            event_id=int(event_id),
+            employee_telegram_user_id=employee_id,
+            question_text=question,
+            missing_fields=list(missing),
+            now=now,
+        )
+        if status != "pending_delivery" or lease_expires_at is not None:
+            connection.execute(
+                "UPDATE clarifications SET status = ?, lease_owner = ?, "
+                "lease_expires_at_utc = ? WHERE id = ?",
+                (
+                    status,
+                    "dead-worker" if lease_expires_at else None,
+                    lease_expires_at,
+                    int(clarification_id),
+                ),
+            )
+    return int(event_id), int(clarification_id)
+
+
+def with_worker(ctx, worker_id: str):
+    """A second application context sharing state but with its own worker id."""
+
+    from dataclasses import replace
+
+    return replace(ctx, worker_id=worker_id)
+
+
+def seed_report_delivery(
+    ctx,
+    *,
+    report_key: str = "daily:9999:2026-11-23",
+    status: str = "pending",
+    chunks: int = 2,
+    chunks_sent: int = 0,
+    attempts: int = 1,
+    snapshot: Optional[bool] = True,
+    lease_expires_at: Optional[str] = None,
+    text: Optional[str] = None,
+    manager_id: int = MANAGER_ID,
+):
+    """Insert a report delivery row in an arbitrary delivery state."""
+
+    body = text or ("📊 گزارش روزانه\n\n" + ("خط گزارش\n\n" * 1200))
+    now = to_utc_iso(ctx.now())
+    snapshot_json = (
+        json.dumps({"facts": {}, "text": body, "narrative_used": False}, ensure_ascii=False)
+        if snapshot
+        else None
+    )
+    with ctx.db.transaction() as connection:
+        connection.execute(
+            "INSERT INTO report_deliveries (report_key, report_type, variant, "
+            "manager_telegram_user_id, period_start_date, period_end_date, scheduled_at_utc, "
+            "status, attempts, chunk_count, chunks_sent, telegram_message_ids, snapshot_json, "
+            "lease_owner, lease_expires_at_utc, created_at_utc, updated_at_utc) "
+            "VALUES (?, 'daily', 'daily', ?, '2026-11-23', '2026-11-23', "
+            "'2026-11-23T20:00:00Z', ?, ?, ?, ?, '[111]', ?, ?, ?, ?, ?)",
+            (
+                report_key,
+                int(manager_id),
+                status,
+                int(attempts),
+                int(chunks),
+                int(chunks_sent),
+                snapshot_json,
+                "dead-worker" if lease_expires_at else None,
+                lease_expires_at,
+                now,
+                now,
+            ),
+        )
+    return int(
+        fetch_one(ctx, "SELECT id FROM report_deliveries WHERE report_key = ?", (report_key,))["id"]
+    )
+
+
 def seed_event(
     ctx,
     seq: int,
@@ -183,6 +333,9 @@ def seed_event(
 
 __all__ = [
     "seed_event",
+    "seed_pending_clarification",
+    "seed_report_delivery",
+    "with_worker",
     "telegram_update",
     "private_update",
     "manager_update",

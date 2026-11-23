@@ -172,10 +172,20 @@ def finish_update(
     now: str,
     error_category: Optional[str] = None,
     error_detail: Optional[str] = None,
-) -> None:
+    worker_id: Optional[str] = None,
+) -> int:
+    """Finalize an update. Returns the number of rows actually changed.
+
+    When ``worker_id`` is supplied the write only applies while this worker still
+    owns the lease. A worker whose lease was taken over by another cron run — for
+    example because the host froze it mid-call — must not overwrite the state of
+    the run that took over. Ownership rather than lease freshness is the guard, so
+    a slow-but-uncontested worker may still finish normally.
+    """
+
     if status not in ("done", "failed", "queued"):
         raise ValueError("unsupported update status: %s" % status)
-    connection.execute(
+    cursor = connection.execute(
         """
         UPDATE telegram_updates
            SET status = ?,
@@ -186,6 +196,7 @@ def finish_update(
                completed_at_utc = ?,
                updated_at_utc = ?
          WHERE update_id = ?
+           AND (? IS NULL OR (lease_owner = ? AND status = 'processing'))
         """,
         (
             status,
@@ -194,8 +205,11 @@ def finish_update(
             now if status in ("done", "failed") else None,
             now,
             update_id,
+            worker_id,
+            worker_id,
         ),
     )
+    return int(cursor.rowcount or 0)
 
 
 def schedule_update_retry(
@@ -206,8 +220,14 @@ def schedule_update_retry(
     now: str,
     error_category: str,
     error_detail: Optional[str] = None,
-) -> None:
-    connection.execute(
+    worker_id: Optional[str] = None,
+) -> int:
+    """Requeue an update for a later attempt. Returns rows changed.
+
+    ``worker_id`` adds the same lease-owner guard as :func:`finish_update`.
+    """
+
+    cursor = connection.execute(
         """
         UPDATE telegram_updates
            SET status = 'queued',
@@ -218,9 +238,19 @@ def schedule_update_retry(
                last_error_detail = ?,
                updated_at_utc = ?
          WHERE update_id = ?
+           AND (? IS NULL OR (lease_owner = ? AND status = 'processing'))
         """,
-        (available_at, error_category, (error_detail or "")[:500] or None, now, update_id),
+        (
+            available_at,
+            error_category,
+            (error_detail or "")[:500] or None,
+            now,
+            update_id,
+            worker_id,
+            worker_id,
+        ),
     )
+    return int(cursor.rowcount or 0)
 
 
 def count_source_messages(connection: sqlite3.Connection) -> int:
@@ -632,48 +662,189 @@ def list_clarifications_for_delivery(
     ).fetchall()
 
 
+# Clarification delivery states
+# ---------------------------
+# pending_delivery -> sending (claim) -> awaiting_answer  (definitely delivered)
+#                                     -> pending_delivery (retryable, not sent)
+#                                     -> unable_to_deliver (permanent rejection)
+#                                     -> delivery_uncertain (outcome unknown)
+# A row left in ``sending`` past its lease is swept to ``delivery_uncertain``.
+CLARIFICATION_OPEN_STATES = ("pending_delivery", "sending", "awaiting_answer", "delivery_uncertain")
+
+
+def claim_clarification_for_delivery(
+    connection: sqlite3.Connection,
+    *,
+    clarification_id: int,
+    now: str,
+    lease_seconds: int,
+    worker_id: str,
+) -> bool:
+    """Claim one due question before calling Telegram.
+
+    The claim is the durable record that a send is about to happen, so a process
+    killed mid-call cannot silently leave the row looking "not yet attempted".
+    """
+
+    lease_expiry = _shift_iso(now, seconds=lease_seconds)
+    cursor = connection.execute(
+        """
+        UPDATE clarifications
+           SET status = 'sending',
+               delivery_attempts = delivery_attempts + 1,
+               lease_owner = ?,
+               lease_expires_at_utc = ?,
+               updated_at_utc = ?
+         WHERE id = ?
+           AND status = 'pending_delivery'
+           AND (next_delivery_attempt_at_utc IS NULL OR next_delivery_attempt_at_utc <= ?)
+        """,
+        (worker_id, lease_expiry, now, clarification_id, now),
+    )
+    return int(cursor.rowcount or 0) == 1
+
+
 def mark_clarification_delivered(
     connection: sqlite3.Connection,
     *,
     clarification_id: int,
     now: str,
     question_count: int,
-) -> None:
-    connection.execute(
+    worker_id: Optional[str] = None,
+) -> int:
+    """Record a confirmed send. Returns rows changed (0 means the claim was lost)."""
+
+    cursor = connection.execute(
         """
         UPDATE clarifications
            SET status = 'awaiting_answer',
                question_count = ?,
-               delivery_attempts = delivery_attempts + 1,
                next_delivery_attempt_at_utc = NULL,
                last_delivery_error = NULL,
+               lease_owner = NULL,
+               lease_expires_at_utc = NULL,
                updated_at_utc = ?
          WHERE id = ?
+           AND (? IS NULL OR (status = 'sending' AND lease_owner = ?))
         """,
-        (question_count, now, clarification_id),
+        (question_count, now, clarification_id, worker_id, worker_id),
     )
+    return int(cursor.rowcount or 0)
 
 
-def mark_clarification_delivery_failed(
+def release_clarification_for_retry(
     connection: sqlite3.Connection,
     *,
     clarification_id: int,
     error_category: str,
-    next_attempt_at: Optional[str],
+    next_attempt_at: str,
     now: str,
-) -> None:
-    connection.execute(
+    worker_id: Optional[str] = None,
+) -> int:
+    """Return a question to ``pending_delivery`` after a definitely-unsent attempt."""
+
+    cursor = connection.execute(
         """
         UPDATE clarifications
-           SET delivery_attempts = delivery_attempts + 1,
+           SET status = 'pending_delivery',
                last_delivery_error = ?,
                next_delivery_attempt_at_utc = ?,
-               status = CASE WHEN ? IS NULL THEN 'unable_to_deliver' ELSE status END,
+               lease_owner = NULL,
+               lease_expires_at_utc = NULL,
                updated_at_utc = ?
          WHERE id = ?
+           AND (? IS NULL OR lease_owner = ?)
         """,
-        (error_category, next_attempt_at, next_attempt_at, now, clarification_id),
+        (error_category, next_attempt_at, now, clarification_id, worker_id, worker_id),
     )
+    return int(cursor.rowcount or 0)
+
+
+def mark_clarification_undeliverable(
+    connection: sqlite3.Connection,
+    *,
+    clarification_id: int,
+    error_category: str,
+    now: str,
+    worker_id: Optional[str] = None,
+) -> int:
+    """Permanent rejection (blocked bot, chat not found, ...). Never retried."""
+
+    cursor = connection.execute(
+        """
+        UPDATE clarifications
+           SET status = 'unable_to_deliver',
+               last_delivery_error = ?,
+               next_delivery_attempt_at_utc = NULL,
+               lease_owner = NULL,
+               lease_expires_at_utc = NULL,
+               updated_at_utc = ?
+         WHERE id = ?
+           AND (? IS NULL OR lease_owner = ?)
+        """,
+        (error_category, now, clarification_id, worker_id, worker_id),
+    )
+    return int(cursor.rowcount or 0)
+
+
+def mark_clarification_delivery_uncertain(
+    connection: sqlite3.Connection,
+    *,
+    clarification_id: int,
+    error_category: str,
+    now: str,
+    worker_id: Optional[str] = None,
+) -> int:
+    """The question may or may not have arrived. Never resend automatically."""
+
+    cursor = connection.execute(
+        """
+        UPDATE clarifications
+           SET status = 'delivery_uncertain',
+               last_delivery_error = ?,
+               next_delivery_attempt_at_utc = NULL,
+               lease_owner = NULL,
+               lease_expires_at_utc = NULL,
+               updated_at_utc = ?
+         WHERE id = ?
+           AND (? IS NULL OR lease_owner = ?)
+        """,
+        (error_category, now, clarification_id, worker_id, worker_id),
+    )
+    return int(cursor.rowcount or 0)
+
+
+def expire_stale_clarification_deliveries(connection: sqlite3.Connection, *, now: str) -> List[int]:
+    """Sweep questions whose sending worker died before recording the outcome.
+
+    Returns the affected ids so the caller can log them for operator review.
+    """
+
+    rows = connection.execute(
+        """
+        SELECT id FROM clarifications
+         WHERE status = 'sending'
+           AND lease_expires_at_utc IS NOT NULL
+           AND lease_expires_at_utc <= ?
+        """,
+        (now,),
+    ).fetchall()
+    ids = [int(row["id"]) for row in rows]
+    for clarification_id in ids:
+        connection.execute(
+            """
+            UPDATE clarifications
+               SET status = 'delivery_uncertain',
+                   last_delivery_error = 'lease_expired_during_send',
+                   next_delivery_attempt_at_utc = NULL,
+                   lease_owner = NULL,
+                   lease_expires_at_utc = NULL,
+                   updated_at_utc = ?
+             WHERE id = ? AND status = 'sending'
+            """,
+            (now, clarification_id),
+        )
+    return ids
 
 
 def mark_clarification_answered(
@@ -702,7 +873,12 @@ def mark_clarification_resolved(
     connection.execute(
         """
         UPDATE clarifications
-           SET status = 'resolved', resolved_at_utc = ?, updated_at_utc = ?
+           SET status = 'resolved',
+               resolved_at_utc = ?,
+               next_delivery_attempt_at_utc = NULL,
+               lease_owner = NULL,
+               lease_expires_at_utc = NULL,
+               updated_at_utc = ?
          WHERE id = ?
         """,
         (now, now, clarification_id),
@@ -735,6 +911,8 @@ def requeue_clarification_question(
                question_text = ?,
                missing_fields = ?,
                next_delivery_attempt_at_utc = ?,
+               lease_owner = NULL,
+               lease_expires_at_utc = NULL,
                updated_at_utc = ?
          WHERE id = ?
         """,
@@ -749,16 +927,26 @@ def list_open_clarifications(
         """
         SELECT * FROM clarifications
          WHERE employee_telegram_user_id = ?
-           AND status IN ('pending_delivery', 'awaiting_answer')
+           AND status IN ('pending_delivery', 'sending', 'awaiting_answer', 'delivery_uncertain')
          ORDER BY id
         """,
         (employee_telegram_user_id,),
     ).fetchall()
 
 
-def count_open_clarifications(connection: sqlite3.Connection) -> int:
+def count_clarifications_in_status(connection: sqlite3.Connection, status: str) -> int:
     row = connection.execute(
-        "SELECT COUNT(*) AS total FROM clarifications WHERE status IN ('pending_delivery','awaiting_answer')"
+        "SELECT COUNT(*) AS total FROM clarifications WHERE status = ?", (status,)
+    ).fetchone()
+    return int(row["total"]) if row else 0
+
+
+def count_open_clarifications(connection: sqlite3.Connection) -> int:
+    """Questions that still need a human: queued, being sent, asked or uncertain."""
+
+    row = connection.execute(
+        "SELECT COUNT(*) AS total FROM clarifications WHERE status IN"
+        " ('pending_delivery', 'sending', 'awaiting_answer', 'delivery_uncertain')"
     ).fetchone()
     return int(row["total"]) if row else 0
 
@@ -816,10 +1004,12 @@ def ensure_report_delivery(
     now: str,
     variant: str = "summary",
     status: str = "pending",
-) -> sqlite3.Row:
+) -> Tuple[sqlite3.Row, bool]:
+    """Create the delivery row once. Returns ``(row, created)``."""
+
     if status not in ("pending", "skipped"):
         raise ValueError("unsupported initial report delivery status: %s" % status)
-    connection.execute(
+    cursor = connection.execute(
         """
         INSERT INTO report_deliveries (report_key, report_type, variant,
                                        manager_telegram_user_id, period_start_date,
@@ -844,7 +1034,7 @@ def ensure_report_delivery(
     )
     row = get_report_delivery_by_key(connection, report_key)
     assert row is not None
-    return row
+    return row, int(cursor.rowcount or 0) == 1
 
 
 def get_report_delivery(connection: sqlite3.Connection, delivery_id: int) -> Optional[sqlite3.Row]:
