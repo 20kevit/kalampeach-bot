@@ -118,6 +118,25 @@ For operational note:
 - All stored timestamps are UTC; business dates use Asia/Tehran.
 - A report must be traceable to the records and query period used to produce it.
 
+## 3b. Physical schema (implemented)
+
+Implemented in `app/migrations/0001_initial.sql` (schema version 1):
+
+| Logical entity | Table | Notes |
+|---|---|---|
+| users | `users` | observed display name + role for audit only; authorization stays in configuration |
+| source messages | `source_messages` | `UNIQUE (chat_id, message_id)`; original text and Telegram provenance |
+| processed updates / inbox | `telegram_inbox` | carries Telegram `update_id UNIQUE`, status, attempts, `available_at`, claim lease |
+| events | `events` | projection; `source_message_id UNIQUE`; `event_type` NULL only while pending; money/quantity as canonical decimal `TEXT`; `confirmed_at_utc` drives the report cutoff |
+| event revisions | `event_revisions` | append-only; `UNIQUE (event_id, revision_number)` and `UNIQUE (event_id, source_message_id)`; previous/new snapshot JSON |
+| clarifications | `clarifications` | question text, missing-field list, round, prompt/response message IDs, delivery state |
+| report deliveries | `report_deliveries` | `report_key UNIQUE`, status (`pending`/`sending`/`sent`/`failed`/`uncertain`), claim lease, fact snapshot |
+| schema version | `schema_migrations` | applied migration version, name, timestamp |
+
+No `processed_updates` table exists because `telegram_inbox` plus the unique
+constraints above already provide the idempotency invariant, as the logical model
+allows.
+
 ## 4. Retention and privacy
 
 Do not retain more Telegram content than needed for auditability and event provenance. Do not log full private messages by default. The owner must set a retention policy before production if legal/business requirements demand one. Do not automatically delete historical records in MVP.

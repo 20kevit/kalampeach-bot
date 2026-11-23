@@ -103,6 +103,31 @@ The application supplies a fact payload containing:
 
 AI may summarize this payload. It must not add numerical claims not present in it. If narrative generation fails, send a deterministic template report rather than failing the report entirely.
 
+## 6b. Implementation notes
+
+- Interface: `app/ai/provider.py` (`AIProvider` protocol with `extract_event`,
+  `interpret_correction`, `interpret_manager_request`, `narrate_report`).
+- Schemas: `app/ai/schema.py` rejects unknown keys, invalid enums, floats for money,
+  fenced/prose-wrapped JSON, non-business output carrying business values, and
+  implausible dates (31 days back / 1 day forward).
+- NVIDIA adapter: `app/ai/nvidia.py` calls an OpenAI-compatible
+  `<NVIDIA_BASE_URL>/chat/completions` endpoint with `NVIDIA_MODEL`,
+  `NVIDIA_TIMEOUT_SECONDS`, `NVIDIA_MAX_RETRIES`, optional
+  `response_format={"type":"json_object"}` behind `NVIDIA_JSON_MODE`. Nothing is
+  hardcoded; no model is chosen by the repository.
+- Exactly **one** bounded repair attempt is made after malformed or schema-invalid
+  output; a second failure becomes `AI_INVALID_OUTPUT`, is observable on the inbox row,
+  and creates no event.
+- Clarification questions are generated deterministically by the application from the
+  validated missing-field list (Persian templates). The model is not asked to invent
+  questions in the MVP, which removes a hallucination surface; the contract permits
+  this because a suggestion is optional.
+- Report narrative: the deterministic template is always sent; an AI narrative is only
+  prepended if a guard proves it contains no number outside the computed facts and no
+  profit claim.
+- Prompts delimit untrusted content and neutralise embedded closing delimiters
+  (`</message>` cannot escape its block). Message content is never logged.
+
 ## 7. Validation and failure policy
 
 - Parse JSON strictly; no markdown fences or surrounding prose accepted as the structured result.

@@ -1,0 +1,20 @@
+# Runtime dependencies for the KalamPeach Telegram Operations Bot.
+# Every package is pinned, including Flask's transitive dependencies, so the
+# cPanel virtual environment matches the version the tests were written against.
+# All are pure-Python or ship wheels: no compiler is required.
+#
+# Python >= 3.9 (zoneinfo); Python 3.11 is the target version.
+Flask==3.0.3
+Werkzeug==3.1.9
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+itsdangerous==2.2.0
+click==8.1.7
+blinker==1.9.0
+requests==2.32.3
+urllib3==2.8.0
+idna==3.20
+certifi==2026.11.20
+charset-normalizer==3.5.3
+# IANA timezone data, for hosts with a minimal system tz database.
+tzdata==2024.2

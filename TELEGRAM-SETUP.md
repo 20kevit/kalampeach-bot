@@ -52,6 +52,19 @@ The production hosting target uses Telegram HTTPS webhooks, not long polling.
 - OpenCode registers or changes the live webhook only during the later deployment phase and only after owner approval. Arena must not configure a live webhook.
 - See `CPANEL-DEPLOYMENT.md` for deployment details.
 
+## 5b. Implemented webhook details
+
+- Route: `POST /telegram/webhook`; health probe `GET /healthz` (no secrets).
+- Secret: `TELEGRAM_WEBHOOK_SECRET` (16–256 chars, `A-Za-z0-9_-`), compared in constant
+  time against `X-Telegram-Bot-Api-Secret-Token`.
+- Registration helper (OpenCode only, requires `--confirm`):
+  `python scripts/set_webhook.py --confirm --env-file /home/USER/private/kalampeach.env`
+  It sets `allowed_updates=["message"]`, which is all the MVP needs.
+- Updates are acknowledged only after durable storage, and duplicates are acknowledged
+  without a second row. Media messages are not sent to the AI provider.
+- If BotFather group privacy was changed after the bot joined, remove and re-add the
+  bot to the group; otherwise Telegram will not deliver ordinary group messages.
+
 ## 6. Controlled test
 
 Before production:
@@ -64,7 +77,7 @@ Before production:
 - Verify a message from another group or unauthorized user is ignored.
 - Verify the manager receives a test report only after explicit approval for the test.
 
-## 6. Operational safety
+## 7. Operational safety
 
 - Do not share the bot token in screenshots, logs, prompts, or source control.
 - If the token is exposed, revoke/rotate it through BotFather and update deployment secrets.

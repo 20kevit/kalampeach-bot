@@ -10,39 +10,39 @@ This roadmap separates repository coding from later hosting operations. It is no
 - [x] Define Arena's GitHub-only coding role and OpenCode's later operations role.
 - [x] Set cPanel shared hosting with Python as the target deployment environment.
 - [x] Define webhook + durable inbox + cPanel cron architecture.
-- [ ] Confirm remaining owner-supplied deployment values.
+- [ ] Confirm remaining owner-supplied deployment values (bot token, group/manager/employee IDs, NVIDIA endpoint/model/key, webhook URL, currency policy).
 
 **Exit:** requirements are internally consistent and cPanel prerequisites are documented.
 
 ## Stage 1 — Arena: application foundation in GitHub
 
-- [ ] Select and document Python version and minimal WSGI-compatible framework.
-- [ ] Add configuration validation and Passenger WSGI entry point.
-- [ ] Add independent database, schema initialization/migrations, and UTC timestamp handling.
-- [ ] Add durable Telegram update inbox and webhook secret validation.
-- [ ] Add structured logging with secret and message-content redaction.
-- [ ] Add automated test suite and local test instructions.
+- [x] Select and document Python version and minimal WSGI-compatible framework (Python 3.11 target / 3.9 minimum, Flask 3.0.3).
+- [x] Add configuration validation and Passenger WSGI entry point (`app/config.py`, `app/wsgi.py`, `passenger_wsgi.py`).
+- [x] Add independent database, schema initialization/migrations, and UTC timestamp handling (`app/db.py`, `app/migrations/`, `app/timeutil.py`).
+- [x] Add durable Telegram update inbox and webhook secret validation (`app/repo/inbox.py`, `app/wsgi.py`).
+- [x] Add structured logging with secret and message-content redaction (`app/logging_setup.py`).
+- [x] Add automated test suite and local test instructions (`tests/`, `TEST-PLAN.md`).
 
-**Exit:** repository contains a complete foundation designed for cPanel; runtime deployment is not claimed.
+**Exit:** repository contains a complete foundation designed for cPanel; runtime deployment is not claimed. **Met.**
 
 ## Stage 2 — Arena: Telegram and event workflows
 
-- [ ] Implement Telegram webhook, routing, authorization, and idempotency.
-- [ ] Implement cron-invoked worker and durable retry handling.
-- [ ] Implement NVIDIA adapter and strict extraction validation.
-- [ ] Implement event capture, clarification, reply-based correction, and revision history.
+- [x] Implement Telegram webhook, routing, authorization, and idempotency.
+- [x] Implement cron-invoked worker and durable retry handling.
+- [x] Implement NVIDIA adapter and strict extraction validation.
+- [x] Implement event capture, clarification, reply-based correction, and revision history.
 
-**Exit:** application code and automated tests cover the full event lifecycle.
+**Exit:** application code and automated tests cover the full event lifecycle. **Met.**
 
 ## Stage 3 — Arena: reports and code handoff
 
-- [ ] Implement deterministic reports and manager-only on-demand reports.
-- [ ] Implement 23:30 Asia/Tehran daily report through cron-driven due-job processing.
-- [ ] Add report idempotency and restart recovery.
-- [ ] Complete cPanel deployment guide and OpenCode handoff.
-- [ ] Update changelog, roadmap, decisions, and README.
+- [x] Implement deterministic reports and manager-only on-demand reports.
+- [x] Implement 23:30 Asia/Tehran daily report through cron-driven due-job processing.
+- [x] Add report idempotency and restart recovery.
+- [x] Complete cPanel deployment guide and OpenCode handoff (`CPANEL-DEPLOYMENT.md`, `OPENCODE-HANDOFF.md`).
+- [x] Update changelog, roadmap, decisions, and README.
 
-**Exit:** code-ready repository is reviewed and handed to OpenCode. Arena does not deploy.
+**Exit:** code-ready repository is reviewed and handed to OpenCode. Arena does not deploy. **Met (pending owner review).**
 
 ## Stage 4 — OpenCode: cPanel inspection and deployment preparation
 
@@ -78,3 +78,4 @@ Potential candidates, only after separate prioritization:
 - More advanced accounting classifications and reconciliation.
 - Additional AI providers or model routing.
 - Role management UI and employee self-service administration.
+- Jalali (Persian) calendar display in reports.

@@ -118,6 +118,28 @@ Use a simple relational database suitable for one bot instance and low operation
 - Do not use an in-memory database for real operation.
 - Do not introduce Redis, Celery, or a separate queue service for MVP; the durable database inbox is the queue.
 
+## 4b. Implemented module map
+
+| Component | Module |
+|---|---|
+| WSGI entry point | `passenger_wsgi.py`, `app/wsgi.py` |
+| Configuration validation | `app/config.py` |
+| Dependency wiring | `app/bootstrap.py`, `app/context.py` |
+| Webhook adapter / inbox | `app/wsgi.py`, `app/repo/inbox.py`, `app/telegram/updates.py` |
+| Authorization | `app/services/authorization.py` |
+| Cron worker | `app/services/worker.py`, `scripts/run_worker.py` |
+| Message processing / routing | `app/services/processor.py` |
+| Event capture and clarification | `app/services/capture.py`, `app/services/clarification.py` |
+| Corrections and audit | `app/services/correction.py`, `app/repo/events.py`, `app/repo/revisions.py` |
+| AI provider interface | `app/ai/provider.py`, `app/ai/schema.py`, `app/ai/prompts.py` |
+| NVIDIA implementation | `app/ai/nvidia.py` |
+| Domain rules | `app/domain/events.py`, `app/money.py`, `app/timeutil.py` |
+| Persistence | `app/db.py`, `app/migrations/`, `app/repo/` |
+| Reporting | `app/services/report_facts.py`, `app/services/report_render.py`, `app/services/reporting.py` |
+| Telegram transport | `app/telegram/client.py` |
+| Logging | `app/logging_setup.py` |
+| User-facing Persian text | `app/messages_fa.py` |
+
 ## 5. Runtime model
 
 - Web requests run through cPanel's supported Python WSGI application mechanism.

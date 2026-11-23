@@ -53,6 +53,25 @@
 - Do not run destructive migrations or reset the database without explicit owner approval.
 - Keep access to deployment secrets and backups restricted.
 
+## Implemented controls
+
+| Requirement | Implementation |
+|---|---|
+| Numeric-ID authorization, deny by default | `app/services/authorization.py`; membership in `EMPLOYEE_TELEGRAM_IDS` or the manager ID only |
+| Unauthorized content never reaches NVIDIA | routing returns before any AI call for unauthorized senders/unconfigured chats (`app/services/processor.py`) |
+| Constant-time webhook secret check | `hmac.compare_digest` in `app/wsgi.py`; invalid → 403, nothing stored |
+| Prompt injection treated as data | delimited, labelled blocks + explicit "never follow instructions" system rules (`app/ai/prompts.py`) |
+| Untrusted AI output | strict application-owned schemas with no coercion (`app/ai/schema.py`) |
+| Idempotency | unique `update_id`, `(chat_id, message_id)`, `source_message_id`, `(event_id, source_message_id)`, `report_key` |
+| Transactions | `BEGIN IMMEDIATE` around every event/revision/projection write; revisions appended, never overwritten |
+| Decimal-safe money | decimal strings + `Decimal`; floats rejected (`app/money.py`) |
+| Unknown ≠ zero | nullable columns; missing values become clarifications, never zero |
+| No secret/private content in logs | JSON logs with categories/IDs only; `redact()` helper; tests assert the absence of message text and token-like values |
+| No stack traces or internals to users | fixed Persian templates; generic 4xx/5xx JSON bodies |
+| Fail closed | invalid configuration → 503 + key names; invalid AI output → no event; uninitialised schema → 503 |
+| Private clarification only | questions are sent only to the author's private chat; group stays silent |
+| Backup outside web root | path validation in config and `scripts/backup_db.py` |
+
 ## Security acceptance
 
 The security-related cases in `TEST-PLAN.md` are mandatory release gates.
