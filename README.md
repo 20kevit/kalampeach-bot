@@ -25,6 +25,12 @@ An independent Telegram bot for capturing Kalam Pich business activity from one 
 - AI may interpret text and explain results; it must never invent, calculate, or silently alter financial totals.
 - Access is controlled by Telegram numeric user IDs and configured chat IDs.
 
+## Build and deployment responsibilities
+
+- **Arena.ai:** writes application code, automated tests, and repository documentation through GitHub only. It does not access cPanel or deploy/run the bot.
+- **OpenCode:** later inspects the actual cPanel account, verifies hosting compatibility, and handles deployment, runtime testing, and operation after owner approval.
+- **Target runtime:** Python on cPanel shared hosting, using a WSGI/Passenger-compatible HTTPS webhook, durable database inbox, and short-lived cPanel cron worker. Production long polling and always-on background processes are not assumed.
+
 ## Documentation map
 
 | File | Purpose |
