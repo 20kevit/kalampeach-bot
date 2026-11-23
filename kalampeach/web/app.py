@@ -151,6 +151,7 @@ class WebhookApp:
             "schema_version": schema_version,
             "expected_schema_version": expected,
             "webhook_path": self.settings.webhook_path,
+            "review_needed": health.get("review_needed", {}),
         }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         status = "200 OK" if ready else "503 Service Unavailable"

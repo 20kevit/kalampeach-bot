@@ -143,6 +143,20 @@ def check_storage(report: Report, settings) -> None:
         else:
             report.add(FAIL, "database_open", str(health.get("error", "unknown error")))
             return
+        review = health.get("review_needed") or {}
+        uncertain = int(review.get("clarifications_uncertain", 0)) + int(
+            review.get("reports_uncertain", 0)
+        )
+        if uncertain:
+            report.add(
+                WARN,
+                "delivery_review_needed",
+                "%d item(s) with an unknown delivery outcome; see OPENCODE-HANDOFF.md"
+                % uncertain,
+            )
+        else:
+            report.add(PASS, "delivery_review_needed", "none")
+
         try:
             with db.connection() as connection:
                 rows = describe(connection)

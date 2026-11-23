@@ -102,6 +102,25 @@ class Database:
         finally:
             connection.close()
 
+    @staticmethod
+    def _review_needed(connection: sqlite3.Connection) -> dict:
+        """Rows whose delivery outcome is unknown and need an operator look.
+
+        Counts only; no message content. Missing tables simply report zero.
+        """
+
+        counts = {"clarifications_uncertain": 0, "reports_uncertain": 0}
+        queries = {
+            "clarifications_uncertain": "SELECT COUNT(*) FROM clarifications WHERE status = 'delivery_uncertain'",
+            "reports_uncertain": "SELECT COUNT(*) FROM report_deliveries WHERE status = 'failed_uncertain'",
+        }
+        for key, sql in queries.items():
+            try:
+                counts[key] = int(connection.execute(sql).fetchone()[0])
+            except sqlite3.Error:
+                counts[key] = 0
+        return counts
+
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
         """Run a block inside a transaction; roll back on any exception."""
@@ -135,6 +154,7 @@ class Database:
                 except sqlite3.Error:
                     info["schema_version"] = 0
                 info["integrity"] = connection.execute("PRAGMA quick_check").fetchone()[0]
+                info["review_needed"] = self._review_needed(connection)
         except (DatabaseError, sqlite3.Error) as exc:
             info["error"] = exc.__class__.__name__
         return info

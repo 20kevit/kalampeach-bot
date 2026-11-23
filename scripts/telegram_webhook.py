@@ -87,16 +87,28 @@ def main(argv=None) -> int:
         return EXIT_FAILURE
 
 
+_INFO_KEYS = (
+    "url",
+    "has_custom_certificate",
+    "pending_update_count",
+    "ip_address",
+    "last_error_date",
+    "last_error_message",
+    "max_connections",
+    "allowed_updates",
+)
+
+
 def _redact_info(info):
+    """Print only the documented getWebhookInfo fields (never echoed blindly).
+
+    Telegram does not return the secret token, but printing an API response
+    unfiltered is how a secret eventually reaches a log file.
+    """
+
     if not isinstance(info, dict):
         return {"result": str(info)}
-    safe = {}
-    for key, value in info.items():
-        if key in ("url", "last_error_message", "ip_address", "description"):
-            safe[key] = value
-        else:
-            safe[key] = value
-    return safe
+    return {key: info[key] for key in _INFO_KEYS if key in info}
 
 
 if __name__ == "__main__":
