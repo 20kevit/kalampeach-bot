@@ -1,0 +1,18 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data and logs
+data/
+logs/
+*.sqlite
+*.sqlite3
+*.db
+
+# Common local environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store
