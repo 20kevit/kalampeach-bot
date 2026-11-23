@@ -1,77 +1,71 @@
 # Roadmap
 
-This roadmap describes the intended MVP delivery order. It is not permission to deploy or contact real users. Keep each stage small and testable.
+This roadmap separates repository coding from later hosting operations. It is not permission to deploy or contact real users.
 
 ## Stage 0 — Requirements and repository baseline
 
 - [x] Confirm independent project boundary.
 - [x] Define one bot, one configured group, employee private chat, manager reporting.
 - [x] Confirm report delivery at 23:30 Asia/Tehran.
-- [x] Document scope, contracts, security, setup, and acceptance criteria.
-- [ ] Confirm remaining deployment values in `DECISIONS.md`.
+- [x] Define Arena's GitHub-only coding role and OpenCode's later operations role.
+- [x] Set cPanel shared hosting with Python as the target deployment environment.
+- [x] Define webhook + durable inbox + cPanel cron architecture.
+- [ ] Confirm remaining owner-supplied deployment values.
 
-**Exit:** requirements are internally consistent and owner-supplied configuration is identified.
+**Exit:** requirements are internally consistent and cPanel prerequisites are documented.
 
-## Stage 1 — Minimal application foundation
+## Stage 1 — Arena: application foundation in GitHub
 
-- [ ] Select and document the simplest maintainable language/framework and runtime.
-- [ ] Add configuration validation and safe startup checks.
+- [ ] Select and document Python version and minimal WSGI-compatible framework.
+- [ ] Add configuration validation and Passenger WSGI entry point.
 - [ ] Add independent database, schema initialization/migrations, and UTC timestamp handling.
+- [ ] Add durable Telegram update inbox and webhook secret validation.
 - [ ] Add structured logging with secret and message-content redaction.
-- [ ] Add automated test setup and health/readiness checks appropriate to the chosen stack.
+- [ ] Add automated test suite and local test instructions.
 
-**Exit:** application starts safely with valid configuration and refuses unsafe/incomplete configuration clearly.
+**Exit:** repository contains a complete foundation designed for cPanel; runtime deployment is not claimed.
 
-## Stage 2 — Telegram ingestion and access control
+## Stage 2 — Arena: Telegram and event workflows
 
-- [ ] Implement one bot and authorized group/private-chat routing.
-- [ ] Enforce configured group ID and numeric user-ID allowlists.
-- [ ] Implement update idempotency.
-- [ ] Handle private Start onboarding and employee DM capability.
-- [ ] Preserve source message metadata and original text.
+- [ ] Implement Telegram webhook, routing, authorization, and idempotency.
+- [ ] Implement cron-invoked worker and durable retry handling.
+- [ ] Implement NVIDIA adapter and strict extraction validation.
+- [ ] Implement event capture, clarification, reply-based correction, and revision history.
 
-**Exit:** authorized text updates are accepted once; unauthorized or unrelated updates cannot create records.
+**Exit:** application code and automated tests cover the full event lifecycle.
 
-## Stage 3 — AI event extraction and persistence
+## Stage 3 — Arena: reports and code handoff
 
-- [ ] Implement NVIDIA adapter using configured endpoint/model.
-- [ ] Implement strict schema-constrained extraction and validation.
-- [ ] Implement business relevance classification and safe ignore behavior.
-- [ ] Persist clear events and pending ambiguous events.
-- [ ] Ask the original employee privately for required clarification.
-- [ ] Add bounded retries and safe failure handling.
+- [ ] Implement deterministic reports and manager-only on-demand reports.
+- [ ] Implement 23:30 Asia/Tehran daily report through cron-driven due-job processing.
+- [ ] Add report idempotency and restart recovery.
+- [ ] Complete cPanel deployment guide and OpenCode handoff.
+- [ ] Update changelog, roadmap, decisions, and README.
 
-**Exit:** supported event types are stored only after validation; ambiguous cases are pending; AI outage never fabricates data.
+**Exit:** code-ready repository is reviewed and handed to OpenCode. Arena does not deploy.
 
-## Stage 4 — Corrections and audit history
+## Stage 4 — OpenCode: cPanel inspection and deployment preparation
 
-- [ ] Resolve Telegram replies to the originating event.
-- [ ] Enforce author-or-manager correction permissions.
-- [ ] Apply corrections as append-only revisions.
-- [ ] Handle unresolved or multi-event reply targets with clarification.
+- [ ] Inspect actual cPanel Python versions and Passenger/WSGI support.
+- [ ] Verify cron minimum interval, outbound HTTPS, webhook reachability, SQLite, storage, quotas, and process limits.
+- [ ] Compare actual host capabilities with documented requirements.
+- [ ] Report blockers and propose minimal compatible adjustments.
+- [ ] Obtain owner approval before changing hosting settings.
 
-**Exit:** corrections are attributable, auditable, and never erase prior values.
+**Exit:** host compatibility is evidenced and owner approves a deployment plan.
 
-## Stage 5 — Reports
+## Stage 5 — OpenCode: controlled deployment and verification
 
-- [ ] Implement deterministic reporting queries and aggregation.
-- [ ] Implement manager-only natural-language report requests.
-- [ ] Implement daily report scheduling at 23:30 Asia/Tehran.
-- [ ] Add duplicate-send protection and retry handling.
-- [ ] Use AI only to explain/summarize computed facts.
+- [ ] Configure Python application and dependencies.
+- [ ] Configure private environment variables and durable database path.
+- [ ] Configure HTTPS Telegram webhook.
+- [ ] Configure cPanel cron worker.
+- [ ] Run migrations and controlled tests after backup.
+- [ ] Verify group intake, private clarification, corrections, and reports using approved test accounts.
+- [ ] Verify 23:30 Asia/Tehran report delivery.
+- [ ] Provide operational handover and backup/restore evidence.
 
-**Exit:** daily and on-demand reports are manager-only, traceable to database facts, and safe across restarts.
-
-## Stage 6 — Verification and release candidate
-
-- [ ] Pass all mandatory tests in `TEST-PLAN.md`.
-- [ ] Verify Telegram privacy settings and real group visibility in a controlled test.
-- [ ] Verify NVIDIA structured output against representative Persian messages.
-- [ ] Verify timezone, daylight-saving behavior, and scheduler restart behavior.
-- [ ] Document backup/restore and operational recovery.
-- [ ] Produce a final implementation report with evidence and remaining limitations.
-
-**Exit:** owner reviews and explicitly approves any live deployment.
+**Exit:** owner explicitly approves production operation after reviewing test evidence.
 
 ## Later — Not part of MVP
 
