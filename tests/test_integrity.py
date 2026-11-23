@@ -92,6 +92,13 @@ def wsgi_request(tmp_path, *, method="GET", path="/health", body=None, secret=""
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def _latest_schema_version() -> int:
+    sys.path.insert(0, str(REPO_ROOT))
+    from kalampeach.migrations import latest_version
+
+    return latest_version()
+
+
 def test_passenger_entry_point_serves_health(tmp_path):
     applied = run_script(tmp_path, "scripts/migrate.py", "--apply")
     assert applied.returncode == 0, applied.stderr
@@ -101,7 +108,7 @@ def test_passenger_entry_point_serves_health(tmp_path):
     document = json.loads(response["body"])
     assert document["status"] == "ok"
     assert document["database_ok"] is True
-    assert document["schema_version"] == document["expected_schema_version"] == 1
+    assert document["schema_version"] == document["expected_schema_version"] == _latest_schema_version()
     assert document["webhook_path"] == "/telegram/webhook"
     # The public database must never be reachable through the app root.
     assert not (REPO_ROOT / "public_html").exists()
@@ -113,7 +120,7 @@ def test_health_reports_degraded_before_migrations(tmp_path):
     document = json.loads(response["body"])
     assert document["status"] == "degraded"
     assert document["schema_version"] == 0
-    assert document["expected_schema_version"] == 1
+    assert document["expected_schema_version"] == _latest_schema_version()
 
 
 def test_passenger_entry_point_accepts_a_signed_update(tmp_path):
@@ -226,7 +233,7 @@ def test_migrate_apply_script_is_idempotent(tmp_path):
     assert second.returncode == 0, second.stderr
     with sqlite3.connect(script_env(tmp_path)["DATABASE_PATH"]) as connection:
         versions = [row[0] for row in connection.execute("SELECT version FROM schema_migrations")]
-    assert versions == [1]
+    assert versions == list(range(1, _latest_schema_version() + 1))
 
 
 def test_doctor_script_reports_missing_configuration_without_secrets(tmp_path):
@@ -311,16 +318,22 @@ def test_restore_procedure_is_documented_and_rehearsed(tmp_path):
 
 
 def test_declared_packages_match_the_repository():
-    import tomllib
+    import re
 
-    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    declared = pyproject["tool"]["setuptools"]["packages"]
+    text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r"^packages\s*=\s*\[(.*?)\]", text, re.MULTILINE | re.DOTALL)
+    assert match is not None, "pyproject.toml must declare the packages explicitly"
+    declared = re.findall(r'"([^"]+)"', match.group(1))
+    assert declared, "no packages declared"
     for package in declared:
         directory = REPO_ROOT / package.replace(".", "/")
         assert directory.is_dir(), package
         assert (directory / "__init__.py").is_file(), "%s needs __init__.py" % package
     assert (REPO_ROOT / "passenger_wsgi.py").is_file()
-    assert pyproject["project"]["dependencies"] == []
+    # No runtime third-party dependencies: cPanel only needs the interpreter.
+    runtime = re.search(r"^dependencies\s*=\s*\[(.*?)\]", text, re.MULTILINE | re.DOTALL)
+    assert runtime is not None
+    assert not re.findall(r'"([^"]+)"', runtime.group(1)), "runtime dependencies must stay empty"
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +384,8 @@ def test_migrations_preserve_existing_records(db):
     assert int(event_id) == 1
 
     with db.connection() as connection:
-        assert ensure_schema(connection) == current_version(connection) == 1
+        version = ensure_schema(connection)
+        assert version == current_version(connection) == _latest_schema_version()
         assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
 
 
@@ -490,12 +504,22 @@ def test_repository_only_uses_parameterized_sql():
     assert "execute(" in source
     # No f-string/percent SQL interpolation into execute calls.
     tree = ast.parse(source)
+
+    def is_literal_sql(node) -> bool:
+        """A literal, or a concatenation of literals (never an f-string/format)."""
+
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, str)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return is_literal_sql(node.left) and is_literal_sql(node.right)
+        return False
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node.func.attr in ("execute", "executemany") and node.args:
-                first = node.args[0]
-                assert isinstance(first, ast.Constant) and isinstance(first.value, str), (
-                    "SQL must be a literal string, values passed as parameters"
+                assert is_literal_sql(node.args[0]), (
+                    "SQL must be a literal string (or literal concatenation); "
+                    "values are passed as parameters"
                 )
 
 
@@ -511,3 +535,93 @@ def test_no_secrets_or_databases_are_tracked(monkeypatch):
     assert "TELEGRAM_BOT_TOKEN=" in example
     assert BASE_ENV["TELEGRAM_BOT_TOKEN"] not in example
     assert "nvapi-" not in example
+
+
+SHIPPED_PYTHON = sorted(
+    [path for path in (REPO_ROOT / "kalampeach").rglob("*.py")]
+    + [path for path in (REPO_ROOT / "scripts").rglob("*.py")]
+    + [REPO_ROOT / "passenger_wsgi.py"]
+)
+
+
+def test_declared_python_minimum_matches_the_syntax():
+    """G: `requires-python = ">=3.9"` must be honest (verified defect G1)."""
+
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    raw = pyproject.split("requires-python =", 1)[1].split("\n", 1)[0].strip()
+    minimum = ast.literal_eval(raw)  # ">=3.9"
+    assert minimum[2:] == "3.9"
+    major, minor = (int(part) for part in minimum[2:].split("."))
+
+    offenders = []
+    for path in SHIPPED_PYTHON:
+        if not path.exists():
+            continue
+        source = path.read_text(encoding="utf-8")
+        try:
+            ast.parse(source, filename=str(path), feature_version=(major, minor))
+        except SyntaxError as exc:  # pragma: no cover - only on a real regression
+            offenders.append("%s: %s" % (path.relative_to(REPO_ROOT), exc))
+    assert not offenders, "syntax requires a newer interpreter: %s" % offenders
+
+
+def test_no_stdlib_apis_newer_than_the_declared_minimum():
+    """tomllib (3.11), datetime.UTC (3.11), StrEnum (3.11), TaskGroup (3.11)."""
+
+    banned = ("tomllib", "datetime.UTC", "StrEnum", "TaskGroup", "ExceptionGroup", "Self")
+    problems = []
+    for path in SHIPPED_PYTHON:
+        if not path.exists():
+            continue
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            code = line.split("#", 1)[0]
+            if any(token in code for token in banned):
+                problems.append("%s:%d: %s" % (path.relative_to(REPO_ROOT), number, line.strip()))
+    assert not problems, problems
+
+
+def test_doctor_warns_about_deliveries_that_need_review(tmp_path):
+    """Operator visibility: an unknown delivery outcome is a WARN, never content."""
+
+    applied = run_script(tmp_path, "scripts/migrate.py", "--apply")
+    assert applied.returncode == 0, applied.stderr
+
+    database = tmp_path / "private" / "kalampeach_bot.sqlite3"
+    connection = sqlite3.connect(str(database))
+    try:
+        now = "2026-11-23T12:00:00Z"
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            "INSERT INTO users (telegram_user_id, display_name, role, created_at_utc,"
+            " updated_at_utc) VALUES (?, 'کارمند', 'employee', ?, ?)",
+            (EMPLOYEE_ID, now, now),
+        )
+        connection.execute(
+            "INSERT INTO source_messages (telegram_update_id, chat_id, chat_type, message_id,"
+            " sender_telegram_user_id, message_timestamp_utc, processing_status,"
+            " created_at_utc, updated_at_utc)"
+            " VALUES (1, -100, 'group', 10, ?, ?, 'processed', ?, ?)",
+            (EMPLOYEE_ID, now, now, now),
+        )
+        connection.execute(
+            "INSERT INTO events (event_type, status, event_date,"
+            " created_by_telegram_user_id, source_message_id, current_revision_number,"
+            " created_at_utc, updated_at_utc)"
+            " VALUES ('sale_revenue', 'pending_clarification', '2026-11-23', ?, 1, 1, ?, ?)",
+            (EMPLOYEE_ID, now, now),
+        )
+        connection.execute(
+            "INSERT INTO clarifications (event_id, employee_telegram_user_id, question_text,"
+            " missing_fields, status, created_at_utc, updated_at_utc)"
+            " VALUES (1, ?, 'مبلغ این فروش چند بود؟', '[]', 'delivery_uncertain', ?, ?)",
+            (EMPLOYEE_ID, now, now),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = run_script(tmp_path, "scripts/doctor.py")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[WARN] delivery_review_needed" in result.stdout
+    assert "1 item(s) with an unknown delivery outcome" in result.stdout
+    assert "مبلغ این فروش" not in result.stdout, "no business content in diagnostics"
