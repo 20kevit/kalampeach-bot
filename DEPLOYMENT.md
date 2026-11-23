@@ -1,6 +1,6 @@
 # Deployment and Configuration
 
-This document defines required configuration, not a live deployment authorization.
+The target deployment is a Python application on shared hosting managed through cPanel. Arena.ai prepares the code and documentation only. OpenCode will later inspect and deploy it after the owner approves the operational steps.
 
 ## 1. Required configuration
 
@@ -11,42 +11,55 @@ See `.env.example`. Required values:
 - Authorized employee numeric Telegram user IDs.
 - NVIDIA API key, base URL, and model ID.
 - Currency/default-currency policy supplied by the owner.
+- Public HTTPS webhook base URL and a strong webhook secret token.
 
 Do not invent values. Startup must validate required settings and fail with a clear, secret-safe message when missing.
 
-## 2. Timezone
+## 2. Target hosting model
+
+- Python application through cPanel's supported Python application feature (commonly Setup Python App with Passenger).
+- WSGI-compatible application entry point.
+- Telegram webhook over HTTPS.
+- Durable database-backed inbox.
+- cPanel Cron Jobs to process updates and scheduled reports.
+- No long polling, persistent daemon, systemd, Docker, Redis, or root access assumed.
+
+See `CPANEL-DEPLOYMENT.md` for the exact target model and later OpenCode handoff.
+
+## 3. Timezone
 
 - Business timezone: `Asia/Tehran`.
 - Daily report time: `23:30`.
 - Database timestamps: UTC.
-- Daily report scheduler must use an IANA timezone database, not a fixed UTC offset.
+- The worker must evaluate due jobs using an IANA timezone database, not the host's default timezone or a fixed UTC offset.
+- cPanel cron may run in a different timezone; schedule the worker frequently and let application code determine whether 23:30 Asia/Tehran has arrived.
 - Test behavior around timezone/DST changes and host timezone differences.
 
-## 3. Database
+## 4. Database
 
 - Use the independent project database.
-- SQLite is the MVP preference unless implementation constraints justify a different relational database.
-- Persist the database on durable storage.
+- SQLite is the MVP preference if supported by the actual hosting account.
+- Persist the database under the account home directory, outside the public web root.
 - Enable foreign keys and transactional writes.
 - Provide versioned schema migrations or a safe initialization mechanism.
 - Never reset an existing database automatically.
 - Back up before migrations and test restore.
+- Avoid concurrent long writes; keep webhook and worker transactions short.
 
-## 4. Runtime
+## 5. Runtime and cPanel checks
 
-The implementation agent must document:
-- Supported runtime and exact version.
-- Installation/build commands.
-- Configuration loading and validation.
-- Start/stop commands.
-- Health/log inspection.
-- Database location and backup procedure.
-- Upgrade/migration procedure.
-- Recovery from NVIDIA/Telegram outages.
+OpenCode must inspect and record:
+- Available Python versions in cPanel.
+- Whether the account exposes Python application setup/Passenger and the supported WSGI interface.
+- Whether cron jobs can run at one-minute intervals.
+- Whether outbound HTTPS requests to Telegram and the selected NVIDIA API are allowed.
+- Whether inbound HTTPS webhooks can reach the application URL.
+- SQLite module availability and durable writable storage.
+- Available disk quota, memory/process limits, and application restart behavior.
 
-Prefer one process for MVP if the selected framework can reliably handle Telegram updates and the daily scheduler. If separate workers are needed, document locking and duplicate prevention.
+Do not claim compatibility until these checks are performed on the actual hosting plan.
 
-## 5. Telegram preconditions
+## 6. Telegram preconditions
 
 - BotFather privacy/group visibility configured to receive normal group text.
 - Bot added to the configured group.
@@ -54,10 +67,11 @@ Prefer one process for MVP if the selected framework can reliably handle Telegra
 - Manager and employees have started the bot privately.
 - Numeric IDs configured and tested.
 - Bot permissions limited to what is necessary.
+- Webhook URL is public HTTPS and webhook secret is configured.
 
 See `TELEGRAM-SETUP.md`.
 
-## 6. NVIDIA preconditions
+## 7. NVIDIA preconditions
 
 Before production, verify:
 - The selected NVIDIA API endpoint is correct for the chosen service.
@@ -68,6 +82,6 @@ Before production, verify:
 
 Never assume all NVIDIA models support identical structured-output features.
 
-## 7. Deployment approval
+## 8. Deployment approval
 
-Do not deploy, expose a webhook, configure DNS, restart a production service, or send real employee/manager messages until the owner explicitly approves the target environment and action.
+Do not deploy, expose/register a webhook, configure cron, configure DNS, restart a production service, or send real employee/manager messages until the owner explicitly approves the target environment and action.
