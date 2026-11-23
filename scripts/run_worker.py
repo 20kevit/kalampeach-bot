@@ -73,6 +73,9 @@ def main(argv=None) -> int:
 
     if not args.quiet:
         print(json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str))
+    if summary.get("phase_failures"):
+        # Something in this run failed; cron should surface a non-zero exit.
+        return EXIT_FAILURE
     return EXIT_OK
 
 

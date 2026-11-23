@@ -211,9 +211,10 @@ def test_worker_applies_migrations_on_a_fresh_database(
         worker_id="fresh-worker",
     )
     summary = Worker(ctx).run_once(skip_reports=True)
-    assert summary["schema_version"] == 1
+    expected = migrations.latest_version()
+    assert summary["schema_version"] == expected
     with db.connection() as connection:
-        assert migrations.current_version(connection) == 1
+        assert migrations.current_version(connection) == expected
 
 
 def test_overlapping_worker_runs_process_each_update_once(ctx, fake_ai):
@@ -263,3 +264,141 @@ def test_worker_skips_reports_when_asked(ctx, fake_ai):
     fake_ai.extractions.append(extraction(amount="10", currency="تومان"))
     summary = run_worker(ctx, skip_reports=True)
     assert summary["reports"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Lease ownership: a worker that lost its lease must not overwrite the run that
+# took over. Verified defect: finish/retry updates were keyed by update_id only.
+# ---------------------------------------------------------------------------
+def _claim_with(ctx, worker_id: str):
+    with ctx.db.transaction() as connection:
+        return repository.claim_next_update(
+            connection,
+            now=to_utc_iso(ctx.now()),
+            lease_seconds=30,
+            max_attempts=5,
+            worker_id=worker_id,
+        )
+
+
+def test_lost_lease_cannot_finish_another_runs_update(ctx):
+    enqueue(ctx, telegram_update(update_id=1, message_id=10, text="فروش"))
+
+    assert _claim_with(ctx, "worker-a") is not None
+    ctx.clock.advance(minutes=5)  # worker A froze past its lease
+    assert _claim_with(ctx, "worker-b") is not None
+
+    with ctx.db.transaction() as connection:
+        changed = repository.finish_update(
+            connection,
+            update_id=1,
+            status="done",
+            now=to_utc_iso(ctx.now()),
+            worker_id="worker-a",
+        )
+
+    assert changed == 0
+    row = fetch_one(ctx, "SELECT * FROM telegram_updates WHERE update_id = 1")
+    assert row["status"] == "processing"
+    assert row["lease_owner"] == "worker-b"
+
+    with ctx.db.transaction() as connection:
+        assert (
+            repository.finish_update(
+                connection,
+                update_id=1,
+                status="done",
+                now=to_utc_iso(ctx.now()),
+                worker_id="worker-b",
+            )
+            == 1
+        )
+    assert fetch_one(ctx, "SELECT status FROM telegram_updates WHERE update_id = 1")["status"] == "done"
+
+
+def test_lost_lease_cannot_requeue_another_runs_update(ctx):
+    enqueue(ctx, telegram_update(update_id=1, message_id=10, text="فروش"))
+    _claim_with(ctx, "worker-a")
+    ctx.clock.advance(minutes=5)
+    _claim_with(ctx, "worker-b")
+
+    with ctx.db.transaction() as connection:
+        changed = repository.schedule_update_retry(
+            connection,
+            update_id=1,
+            available_at=to_utc_iso(ctx.now()),
+            now=to_utc_iso(ctx.now()),
+            error_category="ai_unavailable",
+            worker_id="worker-a",
+        )
+
+    assert changed == 0
+    row = fetch_one(ctx, "SELECT * FROM telegram_updates WHERE update_id = 1")
+    assert row["status"] == "processing"
+    assert row["lease_owner"] == "worker-b"
+    assert row["last_error_category"] != "ai_unavailable"
+
+
+def test_zombie_worker_reports_a_lost_lease_instead_of_overwriting(ctx, fake_ai, fake_telegram):
+    from helpers import with_worker
+
+    enqueue(ctx, telegram_update(update_id=1, message_id=10, text="فروش"))
+    worker_a = Worker(with_worker(ctx, "worker-a"))
+    row_a = worker_a._claim(ctx.now())
+    assert row_a is not None
+
+    ctx.clock.advance(minutes=5)
+    worker_b = Worker(with_worker(ctx, "worker-b"))
+    assert worker_b._claim(ctx.now()) is not None
+
+    # Worker A wakes up and finishes its (stale) row.
+    summary = {
+        "claimed": 1,
+        "done": 0,
+        "retried": 0,
+        "failed": 0,
+        "duplicates": 0,
+        "lease_lost": 0,
+    }
+    fake_ai.extractions.append(extraction(amount="10", currency="تومان"))
+    worker_a._process_row(row_a, ctx.now(), summary)
+
+    assert summary["lease_lost"] == 1
+    assert summary["done"] == 0
+    row = fetch_one(ctx, "SELECT * FROM telegram_updates WHERE update_id = 1")
+    assert row["status"] == "processing"
+    assert row["lease_owner"] == "worker-b"
+
+
+def test_uncontested_slow_worker_may_still_finish(ctx):
+    enqueue(ctx, telegram_update(update_id=1, message_id=10, text="فروش"))
+    _claim_with(ctx, "worker-a")
+    ctx.clock.advance(minutes=5)  # lease expired, but nobody took over
+
+    with ctx.db.transaction() as connection:
+        changed = repository.finish_update(
+            connection,
+            update_id=1,
+            status="done",
+            now=to_utc_iso(ctx.now()),
+            worker_id="worker-a",
+        )
+    assert changed == 1, "ownership, not lease freshness, decides"
+
+
+def test_a_failing_phase_does_not_starve_the_others(ctx, monkeypatch):
+    seed_event = __import__("helpers").seed_event
+    seed_event(ctx, 1, amount="1000")
+    ctx.clock.set(__import__("datetime").datetime(2026, 11, 23, 20, 0, 5, tzinfo=__import__("datetime").timezone.utc))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("clarification delivery is broken")
+
+    monkeypatch.setattr(
+        "kalampeach.services.capture.CaptureService.deliver_pending_clarifications", boom
+    )
+    summary = run_worker(ctx)
+
+    assert summary["phase_failures"] == {"clarifications": "RuntimeError"}
+    # The daily report still ran and was delivered.
+    assert summary["reports"]["deliveries"] == {"sent": 1}

@@ -72,8 +72,10 @@ class Worker:
             "retried": 0,
             "failed": 0,
             "duplicates": 0,
+            "lease_lost": 0,
             "clarifications": {},
             "reports": {},
+            "phase_failures": {},
             "elapsed_seconds": 0.0,
         }
 
@@ -94,21 +96,44 @@ class Worker:
             summary["claimed"] = int(summary["claimed"]) + 1
             self._process_row(row, moment, summary)
 
-        summary["clarifications"] = self.processor.capture.deliver_pending_clarifications(moment)
+        # The three phases are independent: a failure in one must not starve the
+        # others (a broken clarification, for example, must not stop the daily
+        # report). Failures are recorded in the JSON summary for cron/operators.
+        summary["clarifications"] = self._run_phase(
+            "clarifications",
+            summary,
+            lambda: self.processor.capture.deliver_pending_clarifications(moment),
+            default={},
+        )
         if not skip_reports:
-            summary["reports"] = self.processor.reports.run_due(moment)
+            summary["reports"] = self._run_phase(
+                "reports",
+                summary,
+                lambda: self.processor.reports.run_due(moment),
+                default={},
+            )
         summary["elapsed_seconds"] = round(time.monotonic() - started, 3)
 
         logger.info(
-            "worker_run claimed=%s done=%s retried=%s failed=%s duplicates=%s elapsed=%.3f",
+            "worker_run claimed=%s done=%s retried=%s failed=%s duplicates=%s lease_lost=%s elapsed=%.3f",
             summary["claimed"],
             summary["done"],
             summary["retried"],
             summary["failed"],
             summary["duplicates"],
+            summary["lease_lost"],
             summary["elapsed_seconds"],
         )
         return summary
+
+    def _run_phase(self, name: str, summary: Dict[str, object], action, *, default):
+        try:
+            return action()
+        except Exception as exc:  # keep the other phases running
+            failures = summary.setdefault("phase_failures", {})
+            failures[name] = exc.__class__.__name__  # type: ignore[index]
+            logger.error("worker_phase_failed phase=%s error=%s", name, exc.__class__.__name__)
+            return default
 
     # ------------------------------------------------------------------
     def _claim(self, moment: datetime):
@@ -127,7 +152,9 @@ class Worker:
         try:
             outcome = self.processor.process(row)
         except PermanentProcessingError as exc:
-            self._finish_failed(update_id, exc.category, exc.source_message_id)
+            if self._finish_failed(update_id, exc.category, exc.source_message_id) is False:
+                self._note_lost_lease(update_id, summary, "failed")
+                return
             summary["failed"] = int(summary["failed"]) + 1
             logger.error("update_failed update_id=%s category=%s", update_id, exc.category)
             return
@@ -142,9 +169,16 @@ class Worker:
             return
 
         with self.ctx.db.transaction() as connection:
-            repository.finish_update(
-                connection, update_id=update_id, status="done", now=to_utc_iso(moment)
+            changed = repository.finish_update(
+                connection,
+                update_id=update_id,
+                status="done",
+                now=to_utc_iso(moment),
+                worker_id=self.ctx.worker_id,
             )
+        if not changed:
+            self._note_lost_lease(update_id, summary, "done")
+            return
         if outcome.ignored:
             summary["duplicates"] = int(summary["duplicates"]) + 1
         summary["done"] = int(summary["done"]) + 1
@@ -153,38 +187,61 @@ class Worker:
         self, update_id: int, attempts: int, category: str, moment: datetime, summary
     ) -> None:
         if attempts >= self.max_attempts:
-            self._finish_failed(update_id, category, None)
+            if self._finish_failed(update_id, category, None) is False:
+                self._note_lost_lease(update_id, summary, "failed")
+                return
             summary["failed"] = int(summary["failed"]) + 1
             logger.error("update_failed update_id=%s category=%s attempts=%d", update_id, category, attempts)
             return
         available_at = moment + timedelta(seconds=backoff_seconds(attempts))
         with self.ctx.db.transaction() as connection:
-            repository.schedule_update_retry(
+            changed = repository.schedule_update_retry(
                 connection,
                 update_id=update_id,
                 available_at=to_utc_iso(available_at),
                 now=to_utc_iso(moment),
                 error_category=category,
                 error_detail="retry scheduled",
+                worker_id=self.ctx.worker_id,
             )
+        if not changed:
+            self._note_lost_lease(update_id, summary, "retry")
+            return
         summary["retried"] = int(summary["retried"]) + 1
         logger.warning(
             "update_retry_scheduled update_id=%s category=%s attempt=%d", update_id, category, attempts
         )
 
+    def _note_lost_lease(self, update_id: int, summary, transition: str) -> None:
+        """Another run took over this update while we were working on it.
+
+        The other run owns the row from here on; this worker must not touch it.
+        """
+
+        summary["lease_lost"] = int(summary.get("lease_lost", 0)) + 1
+        logger.warning(
+            "update_lease_lost update_id=%s transition=%s worker_id=%s",
+            update_id,
+            transition,
+            self.ctx.worker_id,
+        )
+
     def _finish_failed(
         self, update_id: int, category: str, source_message_id: Optional[int]
-    ) -> None:
+    ) -> Optional[bool]:
         now_iso = to_utc_iso(self.ctx.now())
         with self.ctx.db.transaction() as connection:
-            repository.finish_update(
+            changed = repository.finish_update(
                 connection,
                 update_id=update_id,
                 status="failed",
                 now=now_iso,
                 error_category=category,
                 error_detail="permanent failure",
+                worker_id=self.ctx.worker_id,
             )
+            if not changed:
+                return False
             if source_message_id is not None:
                 repository.set_source_status(
                     connection,
@@ -193,3 +250,4 @@ class Worker:
                     failure_reason=category,
                     now=now_iso,
                 )
+        return True
