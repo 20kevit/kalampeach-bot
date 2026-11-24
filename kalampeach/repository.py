@@ -1108,6 +1108,13 @@ def claim_report_delivery(
     return cursor.rowcount == 1
 
 
+# Outcomes for settling a delivery abandoned mid-send; see
+# settle_stale_report_delivery.
+STALE_SENT = "sent"
+STALE_RESTART = "restart"
+STALE_UNCERTAIN = "uncertain"
+
+
 def release_report_delivery(
     connection: sqlite3.Connection,
     *,
@@ -1116,18 +1123,29 @@ def release_report_delivery(
     error_category: Optional[str],
     next_attempt_at: Optional[str],
     now: str,
-) -> None:
+    worker_id: Optional[str],
+) -> int:
+    """Release a delivery. Returns rows changed (0 when the lease was lost).
+
+    ``worker_id`` fences the write: only the worker that claimed the delivery may
+    release it, so a worker whose lease expired cannot clear the lease of the run
+    that took over. Passing ``None`` disables the fence and is reserved for
+    maintenance/repair code that deliberately acts without a lease.
+    """
+
     if status not in ("pending", "failed", "failed_uncertain", "skipped"):
         raise ValueError("unsupported report delivery status: %s" % status)
-    connection.execute(
+    cursor = connection.execute(
         """
         UPDATE report_deliveries
            SET status = ?, last_error_category = ?, next_attempt_at_utc = ?,
                lease_owner = NULL, lease_expires_at_utc = NULL, updated_at_utc = ?
          WHERE id = ?
+           AND (? IS NULL OR lease_owner = ?)
         """,
-        (status, error_category, next_attempt_at, now, delivery_id),
+        (status, error_category, next_attempt_at, now, delivery_id, worker_id, worker_id),
     )
+    return int(cursor.rowcount or 0)
 
 
 def update_report_progress(
@@ -1140,14 +1158,23 @@ def update_report_progress(
     snapshot_json: Optional[str],
     narrative_used: bool,
     now: str,
-) -> None:
-    connection.execute(
+    worker_id: Optional[str],
+) -> int:
+    """Record per-chunk progress. Returns rows changed (0 when the lease was lost).
+
+    Ownership is checked in the same statement, so a stale worker can neither
+    advance nor corrupt the progress of a delivery another worker now owns.
+    Passing ``None`` disables the fence (maintenance/repair only).
+    """
+
+    cursor = connection.execute(
         """
         UPDATE report_deliveries
            SET chunk_count = ?, chunks_sent = ?, telegram_message_ids = ?,
                snapshot_json = COALESCE(?, snapshot_json), narrative_used = ?,
                updated_at_utc = ?
          WHERE id = ?
+           AND (? IS NULL OR (lease_owner = ? AND status = 'sending'))
         """,
         (
             chunk_count,
@@ -1157,23 +1184,123 @@ def update_report_progress(
             1 if narrative_used else 0,
             now,
             delivery_id,
+            worker_id,
+            worker_id,
         ),
     )
+    return int(cursor.rowcount or 0)
 
 
 def mark_report_sent(
-    connection: sqlite3.Connection, *, delivery_id: int, now: str
-) -> None:
-    connection.execute(
+    connection: sqlite3.Connection,
+    *,
+    delivery_id: int,
+    now: str,
+    worker_id: Optional[str],
+) -> int:
+    """Finalize a delivery. Returns rows changed (0 when the lease was lost).
+
+    ``None`` disables the fence (maintenance/repair only).
+    """
+
+    cursor = connection.execute(
         """
         UPDATE report_deliveries
            SET status = 'sent', sent_at_utc = ?, lease_owner = NULL,
                lease_expires_at_utc = NULL, next_attempt_at_utc = NULL,
                last_error_category = NULL, updated_at_utc = ?
          WHERE id = ?
+           AND (? IS NULL OR (lease_owner = ? AND status = 'sending'))
         """,
-        (now, now, delivery_id),
+        (now, now, delivery_id, worker_id, worker_id),
     )
+    return int(cursor.rowcount or 0)
+
+
+def settle_stale_report_delivery(
+    connection: sqlite3.Connection,
+    *,
+    delivery_id: int,
+    now: str,
+    outcome: str,
+) -> int:
+    """Settle a delivery abandoned by a dead worker. Returns rows changed.
+
+    The ``WHERE`` clause re-checks *in the same statement* that the row is still
+    ``sending`` and that its lease is absent or expired. A worker that holds a
+    live lease is therefore never overwritten, even if the caller read the row a
+    moment earlier. The caller passes the decision derived from the row's own
+    recorded progress (all chunks confirmed / nothing attempted / some in flight).
+    """
+
+    if outcome == STALE_SENT:
+        cursor = connection.execute(
+            """
+            UPDATE report_deliveries
+               SET status = 'sent', sent_at_utc = ?, lease_owner = NULL,
+                   lease_expires_at_utc = NULL, next_attempt_at_utc = NULL,
+                   last_error_category = NULL, updated_at_utc = ?
+             WHERE id = ?
+               AND status = 'sending'
+               AND (lease_expires_at_utc IS NULL OR lease_expires_at_utc <= ?)
+            """,
+            (now, now, delivery_id, now),
+        )
+        return int(cursor.rowcount or 0)
+    if outcome == STALE_RESTART:
+        cursor = connection.execute(
+            """
+            UPDATE report_deliveries
+               SET status = 'pending', last_error_category = 'interrupted_before_send',
+                   next_attempt_at_utc = NULL, lease_owner = NULL,
+                   lease_expires_at_utc = NULL, updated_at_utc = ?
+             WHERE id = ?
+               AND status = 'sending'
+               AND (lease_expires_at_utc IS NULL OR lease_expires_at_utc <= ?)
+            """,
+            (now, delivery_id, now),
+        )
+        return int(cursor.rowcount or 0)
+    if outcome == STALE_UNCERTAIN:
+        cursor = connection.execute(
+            """
+            UPDATE report_deliveries
+               SET status = 'failed_uncertain', last_error_category = 'chunk_outcome_unknown',
+                   next_attempt_at_utc = NULL, lease_owner = NULL,
+                   lease_expires_at_utc = NULL, updated_at_utc = ?
+             WHERE id = ?
+               AND status = 'sending'
+               AND (lease_expires_at_utc IS NULL OR lease_expires_at_utc <= ?)
+            """,
+            (now, delivery_id, now),
+        )
+        return int(cursor.rowcount or 0)
+    raise ValueError("unsupported stale delivery outcome: %s" % outcome)
+
+
+def fail_exhausted_report_delivery(
+    connection: sqlite3.Connection, *, delivery_id: int, now: str
+) -> int:
+    """Give up on a delivery that used all its attempts. Returns rows changed.
+
+    Guarded against a live lease as well, so a worker that just claimed the
+    delivery is never overwritten by another run's exhaustion decision.
+    """
+
+    cursor = connection.execute(
+        """
+        UPDATE report_deliveries
+           SET status = 'failed', last_error_category = 'retry_exhausted',
+               next_attempt_at_utc = NULL, updated_at_utc = ?
+         WHERE id = ?
+           AND status IN ('pending', 'failed')
+           AND (lease_owner IS NULL
+                OR lease_expires_at_utc IS NULL
+                OR lease_expires_at_utc <= ?)
+        """,
+        (now, delivery_id, now),
+    )
+    return int(cursor.rowcount or 0)
 
 
 def list_report_deliveries_due(

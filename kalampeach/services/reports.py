@@ -44,6 +44,16 @@ LATE_AFTER = timedelta(minutes=10)
 MAX_GAP_SCAN_DAYS = 30
 
 
+class DeliveryLeaseLost(Exception):
+    """A guarded report-delivery write matched no row: another worker owns it.
+
+    Raised by the delivery transitions so a stale worker stops immediately
+    instead of continuing to send chunks or overwrite the new owner's state. It
+    never escapes :meth:`ReportService._deliver`; the run summary reports
+    ``lease_lost``.
+    """
+
+
 class ReportService:
     def __init__(self, ctx: AppContext, notifier: Optional[Notifier] = None) -> None:
         self.ctx = ctx
@@ -194,9 +204,10 @@ class ReportService:
             if status in ("failed_uncertain", "skipped"):
                 return status
 
+            resolved = None
             if status == "sending":
                 # A previous run claimed this delivery and never recorded how far
-                # it got. Resolve that before touching Telegram again.
+                # it got. Settle it from its own progress before touching Telegram.
                 outcome, bookkeeping_outcome = self._resolve_interrupted_delivery(
                     connection, row, now_iso
                 )
@@ -204,22 +215,17 @@ class ReportService:
                     resolved = outcome
                 else:
                     row = repository.get_report_delivery(connection, delivery_id)
-                    resolved = None
-            else:
-                resolved = None
 
             if resolved is None and row is not None:
                 if int(row["attempts"]) >= REPORT_MAX_ATTEMPTS:
-                    repository.release_report_delivery(
-                        connection,
-                        delivery_id=delivery_id,
-                        status="failed",
-                        error_category="retry_exhausted",
-                        next_attempt_at=None,
-                        now=now_iso,
+                    settled = repository.fail_exhausted_report_delivery(
+                        connection, delivery_id=delivery_id, now=now_iso
                     )
-                    logger.error("report_retry_exhausted delivery_id=%s", delivery_id)
-                    resolved = "exhausted"
+                    if settled:
+                        logger.error("report_retry_exhausted delivery_id=%s", delivery_id)
+                        resolved = "exhausted"
+                    else:
+                        resolved = "busy"
                 else:
                     claimed = repository.claim_report_delivery(
                         connection,
@@ -242,7 +248,22 @@ class ReportService:
             return "missing"
 
         try:
+            return self._send_delivery(row, manager_id, moment)
+        except DeliveryLeaseLost:
+            # Another worker took over: stop silently. It owns the delivery now
+            # and the stale worker must not clear its lease or its progress.
+            logger.error("report_delivery_lease_lost delivery_id=%s", delivery_id)
+            return "lease_lost"
+
+    def _send_delivery(self, row, manager_id: int, moment: datetime) -> str:
+        """Build (or resume) and send a delivery this worker owns."""
+
+        delivery_id = int(row["id"])
+        try:
             built = self._load_or_build(row, moment)
+        except DeliveryLeaseLost:
+            # Losing the lease is not a build failure: propagate it untouched.
+            raise
         except Exception as exc:  # computation or storage failure
             logger.error("report_build_failed delivery_id=%s error=%s", delivery_id, exc.__class__.__name__)
             self._release(delivery_id, "failed", "report_build_failed", None, moment)
@@ -280,7 +301,7 @@ class ReportService:
                 return outcome
             message_ids.append(int(message_id))
             with self.ctx.db.transaction() as connection:
-                repository.update_report_progress(
+                changed = repository.update_report_progress(
                     connection,
                     delivery_id=delivery_id,
                     chunk_count=len(chunks),
@@ -289,12 +310,28 @@ class ReportService:
                     snapshot_json=None,
                     narrative_used=narrative_used,
                     now=to_utc_iso(moment),
+                    worker_id=self.ctx.worker_id,
                 )
+            if not changed:
+                # The chunk was sent but this worker no longer owns the delivery.
+                # Do not send another chunk and do not touch the new owner's row.
+                logger.error(
+                    "report_delivery_progress_rejected delivery_id=%s chunk=%d",
+                    delivery_id,
+                    index + 1,
+                )
+                raise DeliveryLeaseLost()
 
         with self.ctx.db.transaction() as connection:
-            repository.mark_report_sent(
-                connection, delivery_id=delivery_id, now=to_utc_iso(moment)
+            changed = repository.mark_report_sent(
+                connection,
+                delivery_id=delivery_id,
+                now=to_utc_iso(moment),
+                worker_id=self.ctx.worker_id,
             )
+        if not changed:
+            logger.error("report_delivery_finalize_rejected delivery_id=%s", delivery_id)
+            raise DeliveryLeaseLost()
         logger.info("report_sent delivery_id=%s chunks=%d", delivery_id, len(chunks))
         return "sent"
 
@@ -308,32 +345,32 @@ class ReportService:
         """
 
         delivery_id = int(row["id"])
-        lease_expiry = row["lease_expires_at_utc"]
-        if lease_expiry is not None and str(lease_expiry) > now_iso:
-            return "busy", None  # another live worker still owns this delivery
-
         chunk_count = int(row["chunk_count"] or 0)
         chunks_sent = int(row["chunks_sent"] or 0)
         if chunk_count > 0 and chunks_sent >= chunk_count:
             # Every chunk was confirmed; only the final bookkeeping was lost.
-            repository.mark_report_sent(connection, delivery_id=delivery_id, now=now_iso)
-            logger.warning("report_delivery_recovered delivery_id=%s chunks=%d", delivery_id, chunk_count)
-            return "sent_recovered", None
-        if chunk_count == 0:
+            outcome = repository.STALE_SENT
+        elif chunk_count == 0:
             # Nothing was built or sent: safe to retry from scratch.
-            repository.release_report_delivery(
-                connection,
-                delivery_id=delivery_id,
-                status="pending",
-                error_category="interrupted_before_send",
-                next_attempt_at=None,
-                now=now_iso,
-            )
-            return None, None
-        # At least one chunk is in flight with an unknown outcome.
-        self._release_in_transaction(
-            connection, delivery_id, "failed_uncertain", "chunk_outcome_unknown", now_iso
+            outcome = repository.STALE_RESTART
+        else:
+            # At least one chunk is in flight with an unknown outcome.
+            outcome = repository.STALE_UNCERTAIN
+
+        # One atomic statement re-checks "still sending, lease gone" while it
+        # writes, so a delivery a live worker now owns is never settled here.
+        settled = repository.settle_stale_report_delivery(
+            connection, delivery_id=delivery_id, now=now_iso, outcome=outcome
         )
+        if not settled:
+            return "busy", None
+        if outcome == repository.STALE_SENT:
+            logger.warning(
+                "report_delivery_recovered delivery_id=%s chunks=%d", delivery_id, chunk_count
+            )
+            return "sent_recovered", None
+        if outcome == repository.STALE_RESTART:
+            return None, None
         return "uncertain", "uncertain"
 
     def _mark_uncertain(
@@ -352,14 +389,24 @@ class ReportService:
     def _release_in_transaction(
         self, connection, delivery_id: int, status: str, category: str, now_iso: str
     ) -> None:
-        repository.release_report_delivery(
+        """Release a delivery this worker owns; raises when ownership is gone."""
+
+        changed = repository.release_report_delivery(
             connection,
             delivery_id=delivery_id,
             status=status,
             error_category=category,
             next_attempt_at=None,
             now=now_iso,
+            worker_id=self.ctx.worker_id,
         )
+        if not changed:
+            logger.error(
+                "report_delivery_release_rejected delivery_id=%s status=%s",
+                delivery_id,
+                status,
+            )
+            raise DeliveryLeaseLost()
 
     def _notify_manager_uncertain(self, manager_id: int) -> None:
         self.notifier.send(manager_id, messages.REPORT_DELIVERY_UNKNOWN, kind="notice")
@@ -415,7 +462,7 @@ class ReportService:
         chunks = chunk_text(text)
 
         with self.ctx.db.transaction() as connection:
-            repository.update_report_progress(
+            changed = repository.update_report_progress(
                 connection,
                 delivery_id=int(row["id"]),
                 chunk_count=len(chunks),
@@ -424,7 +471,15 @@ class ReportService:
                 snapshot_json=json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
                 narrative_used=bool(narrative),
                 now=to_utc_iso(moment),
+                worker_id=self.ctx.worker_id,
             )
+        if not changed:
+            # Freezing the snapshot is the first owned write; failing it means the
+            # delivery already belongs to someone else, so nothing may be sent.
+            logger.error(
+                "report_delivery_freeze_rejected delivery_id=%s", int(row["id"])
+            )
+            raise DeliveryLeaseLost()
         return snapshot, chunks
 
     def _narrative(self, facts: Mapping[str, object], variant: str, period) -> Optional[str]:
@@ -495,15 +550,23 @@ class ReportService:
         next_attempt_at: Optional[datetime],
         moment: datetime,
     ) -> None:
+        """Release a delivery this worker owns; raises when ownership is gone."""
+
         with self.ctx.db.transaction() as connection:
-            repository.release_report_delivery(
+            changed = repository.release_report_delivery(
                 connection,
                 delivery_id=delivery_id,
                 status=status,
                 error_category=category,
                 next_attempt_at=to_utc_iso(next_attempt_at) if next_attempt_at else None,
                 now=to_utc_iso(moment),
+                worker_id=self.ctx.worker_id,
             )
+        if not changed:
+            logger.error(
+                "report_delivery_release_rejected delivery_id=%s status=%s", delivery_id, status
+            )
+            raise DeliveryLeaseLost()
 
     # ------------------------------------------------------------------
     # On-demand reports (manager only)
