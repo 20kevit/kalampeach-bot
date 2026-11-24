@@ -229,7 +229,14 @@ class CaptureService:
 
         moment = now or self.ctx.now()
         now_iso = to_utc_iso(moment)
-        stats = {"sent": 0, "retry": 0, "unable": 0, "uncertain": 0, "skipped": 0}
+        stats = {
+            "sent": 0,
+            "retry": 0,
+            "unable": 0,
+            "uncertain": 0,
+            "skipped": 0,
+            "rejected": 0,
+        }
 
         with self.ctx.db.transaction() as connection:
             stale = repository.expire_stale_clarification_deliveries(connection, now=now_iso)
@@ -360,13 +367,24 @@ class CaptureService:
 
         # Definitely not delivered (permanent rejection or attempts exhausted).
         with self.ctx.db.transaction() as connection:
-            repository.mark_clarification_undeliverable(
+            changed = repository.mark_clarification_undeliverable(
                 connection,
                 clarification_id=clarification_id,
                 error_category=exc.category,
                 now=now_iso,
                 worker_id=worker_id,
             )
+        if not changed:
+            # Rejected: this worker no longer owns the lease, or the row already
+            # reached another state. The current owner (or the answer that won)
+            # decides what happens to the question, so announce nothing, send no
+            # other message and do not retry a permanent failure.
+            logger.warning(
+                "clarification_undeliverable_not_recorded clarification_id=%s category=%s",
+                clarification_id,
+                exc.category,
+            )
+            return "rejected"
         self._send_setup_hint(int(row["event_id"]))
         logger.warning(
             "clarification_undeliverable clarification_id=%s category=%s attempts=%d",
