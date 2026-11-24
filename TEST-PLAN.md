@@ -127,6 +127,27 @@ behavior that was wrong before the fix.
 - [ ] The declared Python minimum (3.9) is enforced by parsing every shipped file with
       `feature_version=(3, 9)` and by a 3.10+/3.11+ API denylist. (G1)
 
+## J. Lease fencing and reply resolution (added in the third pass)
+
+- [ ] A worker that lost a report-delivery lease cannot update chunk progress, mark the
+      delivery sent, release it, or settle it, and leaves the new owner's lease intact.
+- [ ] The retry-exhaustion decision cannot override a delivery another worker just claimed.
+- [ ] A stale worker that notices the loss stops sending immediately; no chunk is sent
+      twice and the manager receives at most one "outcome unknown" notice for the delivery.
+- [ ] The worker that owns the delivery can still finish it normally.
+- [ ] An employee who answers a clarification question before the bot has recorded the
+      question message is answered, not ignored; the event is confirmed.
+- [ ] The same holds when the sending process died and the mapping will never appear
+      (`delivery_uncertain`), including after a restart.
+- [ ] The answer is applied exactly once: no second revision, no second confirmation, and
+      a duplicated Telegram update or a later reply to the same question changes nothing.
+- [ ] A crash while applying the answer leaves the reply queued and the event untouched;
+      the retry applies it once.
+- [ ] A reply from another employee, or a group reply, is never attributed to someone
+      else's question; two unconfirmed questions for one employee are never guessed.
+- [ ] An expired or never-attempted question cannot be reopened by a late reply.
+- [ ] The group still receives nothing from this path.
+
 ## H. Human acceptance test
 
 Using a controlled Telegram test group and test accounts after OpenCode has configured a test environment:
@@ -151,14 +172,15 @@ The owner reviews the results before production deployment.
 | F. Reports | `test_reporting.py`, `test_reports.py`, `test_report_delivery_safety.py` | Frozen content, per-chunk resume, gap scan. |
 | G. cPanel and integrity | `test_integrity.py`, `test_migrations.py`, `test_config.py`, `test_decimal_time.py` | Local only; says nothing about the real account. |
 | I. Delivery integrity | `test_clarification_delivery.py`, `test_report_delivery_safety.py`, `test_migrations.py` | |
+| J. Lease fencing and reply resolution | `test_report_delivery_lease.py` (11), `test_clarification_reply_race.py` (19) | 30 tests added in the third pass |
 | H. Human acceptance | — | Requires the owner's test group and a deployed instance. |
 
 ## Test evidence
 
-Arena reports (second pass, executed locally): `python3 -m pytest` →
-`295 passed in 6.56s` on Python 3.11.2 / SQLite 3.40.1. 250 of those tests existed at the
-start of the pass; 45 were added. Nothing in section H was executed. No test reached
-Telegram, NVIDIA, cPanel or the accounting system — every external call is a fake.
+Arena reports (third pass, executed locally): `python3 -m pytest` → `325 passed in 8.07s`
+on Python 3.11.2 / SQLite 3.40.1. The second pass had left 295 passing tests; 30 were
+added and no existing test was modified. Nothing in section H was executed. No test
+reached Telegram, NVIDIA, cPanel or the accounting system — every external call is a fake.
 
 OpenCode must later report:
 - Exact test commands.

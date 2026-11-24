@@ -2,6 +2,62 @@
 
 All notable project changes are recorded here.
 
+## [0.2.1] — Lease fencing and immediate-reply recovery (unreleased, not deployed)
+
+Third pass on `arena/c55428c7-kalampeach-bot`, starting at `234d134`. Two independently
+reported reliability defects were reproduced with executable scripts before being fixed.
+Both fixes keep the existing architecture: same tables, same states, same no-blind-resend
+rules, no new dependency, no schema migration.
+
+### Fixed — report-delivery lease fencing (Issue 1)
+
+| Aspect | Verified defect at 234d134 | Now |
+|---|---|---|
+| `update_report_progress` | No ownership condition: A's stale write rewrote `chunks_sent` 1 → 9, replaced the recorded message ids and flipped `narrative_used` for a delivery B owned. | Ownership is checked in the same `UPDATE` (`lease_owner = ? AND status = 'sending'`); the call returns the affected-row count. |
+| `mark_report_sent` | No ownership condition: A could mark a delivery `sent` while B was still sending it, and clear B's lease. | Same statement-level fence; a stale call changes 0 rows. |
+| `release_report_delivery` | No ownership condition: A could return B's delivery to `pending`, clear B's lease and overwrite `last_error_category`. | Fenced by `lease_owner = ?`; 0 rows means "someone else owns it". |
+| Interrupted-delivery settlement | Read-then-write decision on lease expiry followed by unfenced writes. | One atomic statement per outcome (`sent` / `restart` / `failed_uncertain`) that re-checks `status = 'sending' AND lease expired` while it writes. |
+| Retry-exhaustion decision | Unfenced `release` could overwrite a worker that had just claimed the delivery. | `fail_exhausted_report_delivery` refuses while a live lease exists. |
+| Caller handling | Return values ignored; a stale worker kept sending chunks. | Every transition is checked. Losing the lease raises an internal `DeliveryLeaseLost`, which `_deliver` reports as `lease_lost` and the worker summary shows; the stale worker stops immediately and sends nothing further. |
+
+`worker_id` is now a required argument of the three fenced transitions, so a future caller
+must decide about ownership explicitly (passing `None` disables the fence and is reserved
+for maintenance code).
+
+### Fixed — immediate clarification reply (Issue 2)
+
+| Aspect | Verified defect at 234d134 | Now |
+|---|---|---|
+| Reply arriving before the mapping | The question was sent, then `clarifications.status` and the `bot_messages` mapping were written. An employee who replied inside that window had the answer dropped: the source row became `ignored`/`unresolved_reply_target`, the inbox row became `done`, the employee received "can't resolve your reply", and the event stayed `pending_clarification` forever. | A reply whose quoted message is unknown is attributed to the employee's question when exactly one clarification for that numeric id is in `sending` or `delivery_uncertain` — the durable proof that a question was attempted but never confirmed. The answer is applied normally. |
+| Sender crash before the mapping | The mapping never appeared, so the answer could never be resolved even later. | Same attribution path: `delivery_uncertain` is durable across restarts, so the answer still resolves the event. |
+| Live `sending` row | `clarification_accepts_answer` rejected a live `sending` row, so even an answer that arrived mid-send was refused. | `sending` is answerable. The sending worker's own transition stays fenced by `status = 'sending' AND lease_owner`, so the answer wins and the sender does not re-apply its delivery state (new summary outcome `answered_during_send`, not `uncertain`). |
+| Lost mapping | A question whose state moved on while it was being sent never got a mapping, leaving later replies unresolvable. | The message id is recorded whenever Telegram returned one, even if the state transition lost the race. |
+| Authorization | — | Attribution is keyed by the numeric sender id and only applies to a private reply in that employee's own chat; the owner check in `handle_answer` is unchanged. |
+| Ambiguity | — | Two or more unconfirmed questions for the same employee are never guessed: the reply stays unresolved and the employee gets the existing notice. |
+| Idempotency | — | A repeated update id is acknowledged without re-processing; a second message quoting an already-resolved question is ignored, never re-applied. |
+
+### Not changed
+
+- No schema migration: the durable signal already existed in `clarifications.status`.
+- Retry, snapshot-freeze, chunk-progress, uncertain-delivery, gap-scan and scheduling
+  semantics are unchanged; the existing regression tests for them still pass untouched.
+
+### Verified locally (executed in this repository, not on the host)
+
+| Command | Result |
+|---|---|
+| `python3 -m pytest` (before changes, at 234d134) | `295 passed in 7.52s` |
+| `python3 -m pytest` (after changes) | `325 passed in 8.07s` |
+| `python3 -m compileall -q kalampeach scripts passenger_wsgi.py` | exit 0 |
+| `/tmp/repro_lease.py` against 234d134 | all three stale transitions applied (defect present) |
+| `/tmp/repro_lease.py` after the fix | none applied; B's lease and progress preserved |
+| `/tmp/repro_reply_race.py` against 234d134 | reply ignored, event stuck in `pending_clarification` |
+| `/tmp/repro_reply_race.py` after the fix | event `confirmed`, reply source `processed`, one confirmation |
+| New tests against the 234d134 tree | 16 of the 30 new tests fail, 14 pass (the ones pinning already-correct behaviour) |
+
+Environment: Python 3.11.2, SQLite 3.40.1, pytest 9.2.0. No live Telegram, NVIDIA, cPanel
+or accounting-system call was made; every database was a disposable temporary file.
+
 ## [0.2.0] — Reliability pass (unreleased, not deployed)
 
 Second development pass on `arena/c55428c7-kalampeach-bot`. The baseline is commit

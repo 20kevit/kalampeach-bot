@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kalampeach-bot"
-version = "0.2.0"
+version = "0.2.1"
 description = "Standalone KalamPeach Telegram operations bot (cPanel WSGI + cron worker)"
 requires-python = ">=3.9"
 # The runtime has no third-party dependencies on purpose: cPanel shared hosting

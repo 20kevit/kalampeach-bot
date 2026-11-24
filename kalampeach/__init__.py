@@ -7,4 +7,4 @@ This package must never import, query, or depend on the separate KalamPeach
 accounting web application, its database, its API, or its credentials.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"

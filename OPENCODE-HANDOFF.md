@@ -1,9 +1,9 @@
 # OpenCode Handoff — KalamPeach Telegram Operations Bot
 
 Written at the end of the second development pass on branch
-`arena/c55428c7-kalampeach-bot` (baseline commit `8d3f93a`). Read this file together
-with [CPANEL-DEPLOYMENT.md](CPANEL-DEPLOYMENT.md) and
-[DECISIONS.md](DECISIONS.md).
+`arena/c55428c7-kalampeach-bot` (baseline commit `8d3f93a`) and updated by the third pass
+(starting commit `234d134`). Read this file together with
+[CPANEL-DEPLOYMENT.md](CPANEL-DEPLOYMENT.md) and [DECISIONS.md](DECISIONS.md).
 
 **Nothing in this repository has been deployed, migrated on a real host, registered as a
 webhook, scheduled in cron, or connected to a real Telegram bot, the NVIDIA API, cPanel or
@@ -24,6 +24,8 @@ Python 3.11.2 / SQLite 3.40.1. External calls use fakes; nothing reached the net
 | Webhook intake | HMAC-compared secret, size limit, duplicate `update_id` acknowledged once, no AI call in the request | `tests/test_webhook.py`, `tests/test_outbox.py` |
 | Authorization | Numeric IDs only; group allowlist; manager-only reports in private chat; correction ownership | `tests/test_authorization.py`, `tests/test_corrections.py` |
 | Clarification lifecycle | Claim before send; exactly one send under 4 concurrent workers; crash between send and bookkeeping does not resend; unknown outcome is `delivery_uncertain`, never resent, still answerable | `tests/test_clarification_delivery.py` (16 tests) |
+| Immediate clarification reply | A reply that arrives before the question's message id is recorded is attributed to the employee's unconfirmed question and answered; the event is confirmed, the answer applied once, and a later bookkeeping commit changes nothing | `tests/test_clarification_reply_race.py` (19 tests) |
+| Report-delivery ownership | Progress, finalize and release are fenced by the lease owner in the same SQL statement; a stale worker stops, sends nothing further, and cannot clear the new owner's lease; settlement and exhaustion decisions require an expired lease | `tests/test_report_delivery_lease.py` (11 tests) |
 | Report delivery | Snapshot frozen before the first chunk; resume at the first unconfirmed chunk; no repeated chunk; unprovable outcome → `failed_uncertain` + one manager notice; lost snapshot never rebuilt | `tests/test_report_delivery_safety.py` (11 tests) |
 | Report schedule | Tehran business dates; 20:30 UTC = 23:30 Tehran; recovery window; multi-day gap recorded once per day and never sent late | `tests/test_reports.py`, `tests/test_reporting.py` |
 | Worker | Bounded batch and elapsed time; lease claims; a worker that lost its lease cannot finish or requeue; phases isolated | `tests/test_worker.py` |
@@ -31,8 +33,8 @@ Python 3.11.2 / SQLite 3.40.1. External calls use fakes; nothing reached the net
 | Integrity | Money as `Decimal`/TEXT, FK enforcement, `0600` file mode, WAL, secrets absent from repo and logs, declared Python 3.9 minimum enforced by AST parsing | `tests/test_integrity.py`, `tests/test_decimal_time.py` |
 | Operator visibility | `/health` → `review_needed` (counts); `doctor.py` → `delivery_review_needed` | `tests/test_integrity.py`, `tests/test_reports.py` |
 
-Full suite: `python3 -m pytest` → **295 passed in 6.56s** (250 pre-existing, 45 added in
-this pass). No lint/static tool is configured in this repository (no ruff/flake8/mypy
+Full suite: `python3 -m pytest` → **325 passed in 8.07s** (250 at the end of the first
+pass, +45 in the second pass, +30 in the third pass; no existing test was modified). No lint/static tool is configured in this repository (no ruff/flake8/mypy
 config, no CI workflow); the checks actually executed are:
 
 ```bash
@@ -195,7 +197,7 @@ cd /home/CPANEL_USER/APP_ROOT
 /home/CPANEL_USER/virtualenv/APP_ROOT/PYVER/bin/python -m pytest
 ```
 
-Expect `295 passed`. If the count differs, report the exact number and the failing names —
+Expect `325 passed`. If the count differs, report the exact number and the failing names —
 do not report "tests passed" generically.
 
 Live acceptance (`TEST-PLAN.md` section H) requires the owner's test group and explicit
@@ -251,13 +253,22 @@ deliberate.
 4. **Exactly-once is per-attempt, not per-eternity.** Telegram offers no idempotency key;
    the code guarantees "never blind-resend", not "impossible to duplicate under any
    network lie".
-5. **Clock and timezone.** The schedule is correct only if the host has a working
+5. **A long report send can outlive its lease.** The delivery lease is not renewed per
+   chunk, so if a multi-chunk send takes longer than `WORKER_LEASE_SECONDS`, the next cron
+   run settles the delivery as an unknown outcome (no duplicate, one manager notice)
+   instead of resuming it. If this happens in practice, raise `WORKER_LEASE_SECONDS`
+   (owner decision in `DECISIONS.md`), not the code.
+6. **Manager period prompts still depend on the mapping.** An immediate reply to an
+   on-demand report's "which period?" prompt can hit the same window that clarifications
+   now survive. It was deliberately left unchanged in the third pass; see
+   `DECISIONS.md`.
+7. **Clock and timezone.** The schedule is correct only if the host has a working
    `Asia/Tehran` tz database; a missing tzdata makes startup fail rather than silently
    shifting the report.
-6. **Two-person review not performed.** A single agent pass, however many tests pass, is
+8. **Two-person review not performed.** A single agent pass, however many tests pass, is
    not a production-readiness claim.
-7. **Sections H (human acceptance) remains unexecuted.**
-8. **No lint/static analysis is configured** in the repository; adding one is a decision
+9. **Sections H (human acceptance) remains unexecuted.**
+10. **No lint/static analysis is configured** in the repository; adding one is a decision
    for the owner, not a hidden step.
 
 ---
