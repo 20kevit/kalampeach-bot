@@ -172,19 +172,20 @@ def finish_update(
     now: str,
     error_category: Optional[str] = None,
     error_detail: Optional[str] = None,
-    worker_id: Optional[str] = None,
+    worker_id: str,
 ) -> int:
     """Finalize an update. Returns the number of rows actually changed.
 
-    When ``worker_id`` is supplied the write only applies while this worker still
-    owns the lease. A worker whose lease was taken over by another cron run — for
-    example because the host froze it mid-call — must not overwrite the state of
-    the run that took over. Ownership rather than lease freshness is the guard, so
-    a slow-but-uncontested worker may still finish normally.
+    The write only applies while this worker still owns the lease. A worker whose
+    lease was taken over by another cron run — for example because the host froze
+    it mid-call — must not overwrite the state of the run that took over.
+    Ownership rather than lease freshness is the guard, so a slow-but-uncontested
+    worker may still finish normally.
     """
 
     if status not in ("done", "failed", "queued"):
         raise ValueError("unsupported update status: %s" % status)
+    _require_worker(worker_id, "finish_update")
     cursor = connection.execute(
         """
         UPDATE telegram_updates
@@ -196,7 +197,8 @@ def finish_update(
                completed_at_utc = ?,
                updated_at_utc = ?
          WHERE update_id = ?
-           AND (? IS NULL OR (lease_owner = ? AND status = 'processing'))
+           AND lease_owner = ?
+           AND status = 'processing'
         """,
         (
             status,
@@ -205,7 +207,6 @@ def finish_update(
             now if status in ("done", "failed") else None,
             now,
             update_id,
-            worker_id,
             worker_id,
         ),
     )
@@ -220,13 +221,14 @@ def schedule_update_retry(
     now: str,
     error_category: str,
     error_detail: Optional[str] = None,
-    worker_id: Optional[str] = None,
+    worker_id: str,
 ) -> int:
     """Requeue an update for a later attempt. Returns rows changed.
 
-    ``worker_id`` adds the same lease-owner guard as :func:`finish_update`.
+    Same mandatory lease-owner guard as :func:`finish_update`.
     """
 
+    _require_worker(worker_id, "schedule_update_retry")
     cursor = connection.execute(
         """
         UPDATE telegram_updates
@@ -238,7 +240,8 @@ def schedule_update_retry(
                last_error_detail = ?,
                updated_at_utc = ?
          WHERE update_id = ?
-           AND (? IS NULL OR (lease_owner = ? AND status = 'processing'))
+           AND lease_owner = ?
+           AND status = 'processing'
         """,
         (
             available_at,
@@ -246,7 +249,6 @@ def schedule_update_retry(
             (error_detail or "")[:500] or None,
             now,
             update_id,
-            worker_id,
             worker_id,
         ),
     )
@@ -710,10 +712,11 @@ def mark_clarification_delivered(
     clarification_id: int,
     now: str,
     question_count: int,
-    worker_id: Optional[str] = None,
+    worker_id: str,
 ) -> int:
     """Record a confirmed send. Returns rows changed (0 means the claim was lost)."""
 
+    _require_worker(worker_id, "mark_clarification_delivered")
     cursor = connection.execute(
         """
         UPDATE clarifications
@@ -725,9 +728,10 @@ def mark_clarification_delivered(
                lease_expires_at_utc = NULL,
                updated_at_utc = ?
          WHERE id = ?
-           AND (? IS NULL OR (status = 'sending' AND lease_owner = ?))
+           AND status = 'sending'
+           AND lease_owner = ?
         """,
-        (question_count, now, clarification_id, worker_id, worker_id),
+        (question_count, now, clarification_id, worker_id),
     )
     return int(cursor.rowcount or 0)
 
@@ -739,10 +743,11 @@ def release_clarification_for_retry(
     error_category: str,
     next_attempt_at: str,
     now: str,
-    worker_id: Optional[str] = None,
+    worker_id: str,
 ) -> int:
     """Return a question to ``pending_delivery`` after a definitely-unsent attempt."""
 
+    _require_worker(worker_id, "release_clarification_for_retry")
     cursor = connection.execute(
         """
         UPDATE clarifications
@@ -753,9 +758,10 @@ def release_clarification_for_retry(
                lease_expires_at_utc = NULL,
                updated_at_utc = ?
          WHERE id = ?
-           AND (? IS NULL OR lease_owner = ?)
+           AND status = 'sending'
+           AND lease_owner = ?
         """,
-        (error_category, next_attempt_at, now, clarification_id, worker_id, worker_id),
+        (error_category, next_attempt_at, now, clarification_id, worker_id),
     )
     return int(cursor.rowcount or 0)
 
@@ -766,10 +772,11 @@ def mark_clarification_undeliverable(
     clarification_id: int,
     error_category: str,
     now: str,
-    worker_id: Optional[str] = None,
+    worker_id: str,
 ) -> int:
     """Permanent rejection (blocked bot, chat not found, ...). Never retried."""
 
+    _require_worker(worker_id, "mark_clarification_undeliverable")
     cursor = connection.execute(
         """
         UPDATE clarifications
@@ -780,9 +787,10 @@ def mark_clarification_undeliverable(
                lease_expires_at_utc = NULL,
                updated_at_utc = ?
          WHERE id = ?
-           AND (? IS NULL OR lease_owner = ?)
+           AND status = 'sending'
+           AND lease_owner = ?
         """,
-        (error_category, now, clarification_id, worker_id, worker_id),
+        (error_category, now, clarification_id, worker_id),
     )
     return int(cursor.rowcount or 0)
 
@@ -793,10 +801,17 @@ def mark_clarification_delivery_uncertain(
     clarification_id: int,
     error_category: str,
     now: str,
-    worker_id: Optional[str] = None,
+    worker_id: str,
 ) -> int:
-    """The question may or may not have arrived. Never resend automatically."""
+    """The question may or may not have arrived. Never resend automatically.
 
+    Fenced on both the delivery lease owner and the previous state: only a row
+    this worker is currently sending may become ``delivery_uncertain``. A row that
+    was answered or resolved while the bookkeeping was failing therefore keeps its
+    terminal state, and a stale worker cannot overwrite the run that took over.
+    """
+
+    _require_worker(worker_id, "mark_clarification_delivery_uncertain")
     cursor = connection.execute(
         """
         UPDATE clarifications
@@ -807,11 +822,23 @@ def mark_clarification_delivery_uncertain(
                lease_expires_at_utc = NULL,
                updated_at_utc = ?
          WHERE id = ?
-           AND (? IS NULL OR lease_owner = ?)
+           AND status = 'sending'
+           AND lease_owner = ?
         """,
-        (error_category, now, clarification_id, worker_id, worker_id),
+        (error_category, now, clarification_id, worker_id),
     )
     return int(cursor.rowcount or 0)
+
+
+def _require_worker(worker_id: Optional[str], transition: str) -> None:
+    """Owner-protected transitions must never be callable without an owner.
+
+    A ``None``/empty worker id used to mean "skip the fence". That made the lease
+    guard optional by accident, so it is now a programming error instead.
+    """
+
+    if not worker_id:
+        raise ValueError("%s requires the worker id that owns the lease" % transition)
 
 
 def expire_stale_clarification_deliveries(connection: sqlite3.Connection, *, now: str) -> List[int]:
@@ -847,14 +874,25 @@ def expire_stale_clarification_deliveries(connection: sqlite3.Connection, *, now
     return ids
 
 
-def mark_clarification_answered(
+def claim_clarification_answer(
     connection: sqlite3.Connection,
     *,
     clarification_id: int,
     response_source_message_id: int,
     now: str,
-) -> None:
-    connection.execute(
+) -> int:
+    """Claim the right to resolve a clarification for one specific reply.
+
+    Returns 1 when this reply now owns the clarification and 0 when it does not.
+    The condition is evaluated by the database in the same statement that writes,
+    so two different replies that both passed the earlier state check cannot both
+    proceed: the first commit moves the row to ``answered``, which is not an
+    eligible state for a second claim. Terminal states (``resolved``, ``expired``,
+    ``unable_to_deliver``) and never-attempted rows (``pending_delivery``) are not
+    claimable, so a late reply can never reopen a closed question.
+    """
+
+    cursor = connection.execute(
         """
         UPDATE clarifications
            SET status = 'answered',
@@ -862,15 +900,63 @@ def mark_clarification_answered(
                answered_at_utc = ?,
                updated_at_utc = ?
          WHERE id = ?
+           AND status IN ('awaiting_answer', 'sending', 'delivery_uncertain')
         """,
         (response_source_message_id, now, now, clarification_id),
     )
+    return int(cursor.rowcount or 0)
+
+
+def release_clarification_answer_claim(
+    connection: sqlite3.Connection,
+    *,
+    clarification_id: int,
+    response_source_message_id: int,
+    now: str,
+) -> int:
+    """Undo a claim that will not be applied (defensive recovery only).
+
+    Not needed on the normal path: the claim, the revision and the resolution are
+    one transaction, so a failure rolls all of them back. This exists for callers
+    that must release an ``answered`` row they own, and it restores the state the
+    delivery evidence supports (a confirmed question goes back to
+    ``awaiting_answer``; an unconfirmed one to ``delivery_uncertain``).
+    """
+
+    cursor = connection.execute(
+        """
+        UPDATE clarifications
+           SET status = CASE WHEN question_count > 0
+                             THEN 'awaiting_answer'
+                             ELSE 'delivery_uncertain' END,
+               response_source_message_id = NULL,
+               answered_at_utc = NULL,
+               updated_at_utc = ?
+         WHERE id = ?
+           AND status = 'answered'
+           AND response_source_message_id = ?
+        """,
+        (now, clarification_id, response_source_message_id),
+    )
+    return int(cursor.rowcount or 0)
+
+
+#: States a clarification can never leave through a bookkeeping transition.
+#: Every resolve/expire/requeue statement filters them out in SQL, so a stale or
+#: duplicate caller cannot rewrite an outcome that is already recorded.
+CLARIFICATION_TERMINAL_STATES = ("resolved", "expired", "unable_to_deliver")
 
 
 def mark_clarification_resolved(
     connection: sqlite3.Connection, *, clarification_id: int, now: str
-) -> None:
-    connection.execute(
+) -> int:
+    """Close a clarification. Returns rows changed (0 when it was already closed).
+
+    The status filter is part of the same statement, so an already terminal row
+    keeps its outcome and the caller can see that nothing happened.
+    """
+
+    cursor = connection.execute(
         """
         UPDATE clarifications
            SET status = 'resolved',
@@ -880,20 +966,29 @@ def mark_clarification_resolved(
                lease_expires_at_utc = NULL,
                updated_at_utc = ?
          WHERE id = ?
+           AND status IN ('pending_delivery', 'sending', 'awaiting_answer',
+                          'delivery_uncertain', 'answered')
         """,
         (now, now, clarification_id),
     )
+    return int(cursor.rowcount or 0)
 
 
-def expire_clarification(connection: sqlite3.Connection, *, clarification_id: int, now: str) -> None:
-    connection.execute(
+def expire_clarification(connection: sqlite3.Connection, *, clarification_id: int, now: str) -> int:
+    """Expire an unanswered clarification. Returns rows changed (0 when terminal)."""
+
+    cursor = connection.execute(
         """
         UPDATE clarifications
-           SET status = 'expired', next_delivery_attempt_at_utc = NULL, updated_at_utc = ?
+           SET status = 'expired', next_delivery_attempt_at_utc = NULL,
+               lease_owner = NULL, lease_expires_at_utc = NULL, updated_at_utc = ?
          WHERE id = ?
+           AND status IN ('pending_delivery', 'sending', 'awaiting_answer',
+                          'delivery_uncertain', 'answered')
         """,
         (now, clarification_id),
     )
+    return int(cursor.rowcount or 0)
 
 
 def requeue_clarification_question(
@@ -903,21 +998,32 @@ def requeue_clarification_question(
     question_text: str,
     missing_fields: Sequence[str],
     now: str,
-) -> None:
-    connection.execute(
+) -> int:
+    """Ask the employee again for what is still missing. Returns rows changed.
+
+    Only a clarification that is still open can be requeued; a closed row keeps
+    its outcome, and a second answer cannot send a new question for it.
+    """
+
+    cursor = connection.execute(
         """
         UPDATE clarifications
            SET status = 'pending_delivery',
                question_text = ?,
                missing_fields = ?,
                next_delivery_attempt_at_utc = ?,
+               response_source_message_id = NULL,
+               answered_at_utc = NULL,
                lease_owner = NULL,
                lease_expires_at_utc = NULL,
                updated_at_utc = ?
          WHERE id = ?
+           AND status IN ('pending_delivery', 'sending', 'awaiting_answer',
+                          'delivery_uncertain', 'answered')
         """,
         (question_text, json.dumps(list(missing_fields)), now, now, clarification_id),
     )
+    return int(cursor.rowcount or 0)
 
 
 def list_open_clarifications(
@@ -1123,27 +1229,27 @@ def release_report_delivery(
     error_category: Optional[str],
     next_attempt_at: Optional[str],
     now: str,
-    worker_id: Optional[str],
+    worker_id: str,
 ) -> int:
     """Release a delivery. Returns rows changed (0 when the lease was lost).
 
-    ``worker_id`` fences the write: only the worker that claimed the delivery may
-    release it, so a worker whose lease expired cannot clear the lease of the run
-    that took over. Passing ``None`` disables the fence and is reserved for
-    maintenance/repair code that deliberately acts without a lease.
+    Only the worker that claimed the delivery may release it, so a worker whose
+    lease expired cannot clear the lease of the run that took over. There is no
+    "skip the fence" mode: a delivery is always released by its owner.
     """
 
     if status not in ("pending", "failed", "failed_uncertain", "skipped"):
         raise ValueError("unsupported report delivery status: %s" % status)
+    _require_worker(worker_id, "release_report_delivery")
     cursor = connection.execute(
         """
         UPDATE report_deliveries
            SET status = ?, last_error_category = ?, next_attempt_at_utc = ?,
                lease_owner = NULL, lease_expires_at_utc = NULL, updated_at_utc = ?
          WHERE id = ?
-           AND (? IS NULL OR lease_owner = ?)
+           AND lease_owner = ?
         """,
-        (status, error_category, next_attempt_at, now, delivery_id, worker_id, worker_id),
+        (status, error_category, next_attempt_at, now, delivery_id, worker_id),
     )
     return int(cursor.rowcount or 0)
 
@@ -1158,15 +1264,15 @@ def update_report_progress(
     snapshot_json: Optional[str],
     narrative_used: bool,
     now: str,
-    worker_id: Optional[str],
+    worker_id: str,
 ) -> int:
     """Record per-chunk progress. Returns rows changed (0 when the lease was lost).
 
     Ownership is checked in the same statement, so a stale worker can neither
     advance nor corrupt the progress of a delivery another worker now owns.
-    Passing ``None`` disables the fence (maintenance/repair only).
     """
 
+    _require_worker(worker_id, "update_report_progress")
     cursor = connection.execute(
         """
         UPDATE report_deliveries
@@ -1174,7 +1280,8 @@ def update_report_progress(
                snapshot_json = COALESCE(?, snapshot_json), narrative_used = ?,
                updated_at_utc = ?
          WHERE id = ?
-           AND (? IS NULL OR (lease_owner = ? AND status = 'sending'))
+           AND lease_owner = ?
+           AND status = 'sending'
         """,
         (
             chunk_count,
@@ -1184,7 +1291,6 @@ def update_report_progress(
             1 if narrative_used else 0,
             now,
             delivery_id,
-            worker_id,
             worker_id,
         ),
     )
@@ -1196,13 +1302,11 @@ def mark_report_sent(
     *,
     delivery_id: int,
     now: str,
-    worker_id: Optional[str],
+    worker_id: str,
 ) -> int:
-    """Finalize a delivery. Returns rows changed (0 when the lease was lost).
+    """Finalize a delivery. Returns rows changed (0 when the lease was lost)."""
 
-    ``None`` disables the fence (maintenance/repair only).
-    """
-
+    _require_worker(worker_id, "mark_report_sent")
     cursor = connection.execute(
         """
         UPDATE report_deliveries
@@ -1210,9 +1314,10 @@ def mark_report_sent(
                lease_expires_at_utc = NULL, next_attempt_at_utc = NULL,
                last_error_category = NULL, updated_at_utc = ?
          WHERE id = ?
-           AND (? IS NULL OR (lease_owner = ? AND status = 'sending'))
+           AND lease_owner = ?
+           AND status = 'sending'
         """,
-        (now, now, delivery_id, worker_id, worker_id),
+        (now, now, delivery_id, worker_id),
     )
     return int(cursor.rowcount or 0)
 

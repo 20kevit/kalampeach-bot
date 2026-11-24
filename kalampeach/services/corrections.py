@@ -180,9 +180,15 @@ class CorrectionService:
             (event_id,),
         ).fetchall()
         for row in rows:
-            repository.mark_clarification_resolved(
+            # The transition is filtered to non-terminal states, so 0 here means
+            # another writer (an answer being applied right now) already closed
+            # the row. Never force it; the event correction itself already applied.
+            if not repository.mark_clarification_resolved(
                 connection, clarification_id=int(row["id"]), now=now_iso
-            )
+            ):
+                logger.info(
+                    "clarification_resolution_skipped clarification_id=%s", int(row["id"])
+                )
 
     def _mark_source(self, source_message_id: int, status: str, reason: Optional[str]) -> None:
         with self.ctx.db.transaction() as connection:

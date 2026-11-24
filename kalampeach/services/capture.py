@@ -386,11 +386,20 @@ class CaptureService:
         )
         try:
             with self.ctx.db.transaction() as connection:
-                repository.mark_clarification_delivery_uncertain(
+                changed = repository.mark_clarification_delivery_uncertain(
                     connection,
                     clarification_id=clarification_id,
                     error_category="bookkeeping_failed",
                     now=self.ctx.now_iso(),
+                    worker_id=self.ctx.worker_id,
+                )
+            if not changed:
+                # Rejected: this worker no longer owns the lease, or the row already
+                # reached a terminal state (most often the employee answered while
+                # the send was in flight). Keep that state; never resend.
+                logger.info(
+                    "clarification_uncertain_not_recorded clarification_id=%s reason=state_not_eligible",
+                    clarification_id,
                 )
         except Exception as inner:  # pragma: no cover - database is down
             logger.critical(
@@ -458,11 +467,8 @@ class CaptureService:
         except domain.DomainError as exc:
             logger.info("clarification_answer_rejected reason=%s", exc.reason)
             # Never post business details into the group: DM the author instead.
-            self.notifier.send(
-                int(clarification["employee_telegram_user_id"]),
-                messages.CORRECTION_UNCLEAR,
-                kind="notice",
-            )
+            # Sent only once this answer actually owns the clarification, so a
+            # superseded answer cannot produce an extra notice.
             self._expire_or_requeue(
                 clarification=clarification,
                 event=event,
@@ -470,6 +476,7 @@ class CaptureService:
                 missing=missing,
                 message=message,
                 moment=self.ctx.now(),
+                unclear_notice=True,
             )
             return ServiceOutcome(action="pending", clarification_id=int(clarification["id"]))
 
@@ -496,49 +503,72 @@ class CaptureService:
         now_iso = self.ctx.now_iso()
         new_draft = assessment.draft
         previous = domain.draft_from_row(event)
+        clarification_id = int(clarification["id"])
+        applied = False
         with self.ctx.db.transaction() as connection:
-            revision_number = repository.next_revision_number(connection, int(event["id"]))
-            storage = new_draft.storage()
-            repository.update_event_fields(
+            # Claim first and in the same transaction as the writes it authorizes.
+            # The claim, the revision and the resolution commit or roll back as a
+            # unit, so a failure below cannot leave a clarification claimed-but-not
+            # -applied, and two different answers cannot both apply.
+            claimed = repository.claim_clarification_answer(
                 connection,
-                event_id=int(event["id"]),
-                status="confirmed",
-                status_reason=None,
-                revision_number=revision_number,
-                now=now_iso,
-                **storage,
-            )
-            repository.insert_revision(
-                connection,
-                event_id=int(event["id"]),
-                revision_number=revision_number,
-                actor_telegram_user_id=int(message.sender_id),
-                change_type="clarification",
-                change_reason="clarification_answer",
-                source_message_id=source_message_id,
-                clarification_id=int(clarification["id"]),
-                previous_snapshot=domain.snapshot_json(
-                    previous.snapshot(status=str(event["status"]))
-                ),
-                new_snapshot=domain.snapshot_json(new_draft.snapshot(status="confirmed")),
-                validation_status="accepted",
-                now=now_iso,
-            )
-            repository.mark_clarification_answered(
-                connection,
-                clarification_id=int(clarification["id"]),
+                clarification_id=clarification_id,
                 response_source_message_id=source_message_id,
                 now=now_iso,
             )
-            repository.mark_clarification_resolved(
-                connection, clarification_id=int(clarification["id"]), now=now_iso
-            )
-            self._resolve_other_clarifications(connection, int(event["id"]), now_iso)
-            repository.set_source_status(
-                connection,
-                source_message_id=source_message_id,
-                processing_status="processed",
-                now=now_iso,
+            if not claimed:
+                logger.info(
+                    "clarification_answer_claim_lost clarification_id=%s source_message_id=%s",
+                    clarification_id,
+                    source_message_id,
+                )
+            else:
+                applied = True
+                revision_number = repository.next_revision_number(connection, int(event["id"]))
+                storage = new_draft.storage()
+                repository.update_event_fields(
+                    connection,
+                    event_id=int(event["id"]),
+                    status="confirmed",
+                    status_reason=None,
+                    revision_number=revision_number,
+                    now=now_iso,
+                    **storage,
+                )
+                repository.insert_revision(
+                    connection,
+                    event_id=int(event["id"]),
+                    revision_number=revision_number,
+                    actor_telegram_user_id=int(message.sender_id),
+                    change_type="clarification",
+                    change_reason="clarification_answer",
+                    source_message_id=source_message_id,
+                    clarification_id=clarification_id,
+                    previous_snapshot=domain.snapshot_json(
+                        previous.snapshot(status=str(event["status"]))
+                    ),
+                    new_snapshot=domain.snapshot_json(new_draft.snapshot(status="confirmed")),
+                    validation_status="accepted",
+                    now=now_iso,
+                )
+                resolved = repository.mark_clarification_resolved(
+                    connection, clarification_id=clarification_id, now=now_iso
+                )
+                if not resolved:  # pragma: no cover - the claim above guarantees it
+                    raise RuntimeError(
+                        "clarification claim lost while resolving %s" % clarification_id
+                    )
+                self._resolve_other_clarifications(connection, int(event["id"]), now_iso)
+                repository.set_source_status(
+                    connection,
+                    source_message_id=source_message_id,
+                    processing_status="processed",
+                    now=now_iso,
+                )
+
+        if not applied:
+            return self._reject_lost_answer(
+                clarification_id=clarification_id, source_message_id=source_message_id
             )
 
         self.notifier.send(
@@ -547,15 +577,46 @@ class CaptureService:
             kind="event_confirmation",
             event_id=int(event["id"]),
         )
-        logger.info("clarification_resolved clarification_id=%s", clarification["id"])
+        logger.info("clarification_resolved clarification_id=%s", clarification_id)
         return ServiceOutcome(
             action="confirmed",
             event_id=int(event["id"]),
-            clarification_id=int(clarification["id"]),
+            clarification_id=clarification_id,
+        )
+
+    def _reject_lost_answer(self, *, clarification_id: int, source_message_id: int) -> ServiceOutcome:
+        """Another answer already owns this clarification: change nothing else.
+
+        Reaching here means the question was answered, resolved or closed between
+        the state check at the start of ``handle_answer`` and this write. The losing
+        answer must not create a revision, touch the event or send a confirmation.
+        """
+
+        try:
+            with self.ctx.db.transaction() as connection:
+                repository.set_source_status(
+                    connection,
+                    source_message_id=source_message_id,
+                    processing_status="ignored",
+                    failure_reason="answer_claim_lost",
+                    now=self.ctx.now_iso(),
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("source_status_failed error=%s", exc.__class__.__name__)
+        return ServiceOutcome(
+            action="duplicate", clarification_id=clarification_id, note="answer_claim_lost"
         )
 
     def _expire_or_requeue(
-        self, *, clarification, event, source_message_id: int, missing, message, moment
+        self,
+        *,
+        clarification,
+        event,
+        source_message_id: int,
+        missing,
+        message,
+        moment,
+        unclear_notice: bool = False,
     ) -> ServiceOutcome:
         """Ask once more for the remaining fields, then stop and stay pending."""
 
@@ -564,53 +625,79 @@ class CaptureService:
         question_count = int(clarification["question_count"])
         can_ask_again = question_count < MAX_QUESTIONS_PER_CLARIFICATION
 
+        claimed = False
         with self.ctx.db.transaction() as connection:
-            repository.mark_clarification_answered(
-                connection,
-                clarification_id=clarification_id,
-                response_source_message_id=source_message_id,
-                now=now_iso,
-            )
-            repository.update_event_fields(
-                connection,
-                event_id=int(event["id"]),
-                event_type=str(event["event_type"]),
-                status=str(event["status"]),
-                event_date=str(event["event_date"]),
-                amount=event["amount"],
-                currency=event["currency"],
-                currency_source=event["currency_source"],
-                item_name=event["item_name"],
-                quantity=event["quantity"],
-                unit=event["unit"],
-                inventory_direction=event["inventory_direction"],
-                description=event["description"],
-                revision_number=int(event["current_revision_number"]),
-                status_reason="missing_fields:" + ",".join(missing),
-                now=now_iso,
-            )
-            if can_ask_again:
-                repository.requeue_clarification_question(
+            # Asking again is also a consequence of this specific answer, so it
+            # needs the same exclusive claim: two concurrent partial answers must
+            # not both requeue or both expire the question. Claim, event note and
+            # requeue/expire share one transaction so a failure cannot strand the
+            # row in ``answered`` with no question behind it.
+            claimed = bool(
+                repository.claim_clarification_answer(
                     connection,
                     clarification_id=clarification_id,
-                    question_text=messages.clarification_question(
-                        list(missing),
-                        prefix="برای تکمیل این مورد هنوز به این اطلاعات نیاز است:",
-                    ),
-                    missing_fields=list(missing),
+                    response_source_message_id=source_message_id,
                     now=now_iso,
                 )
-            else:
-                repository.expire_clarification(
-                    connection, clarification_id=clarification_id, now=now_iso
+            )
+            if claimed:
+                repository.update_event_fields(
+                    connection,
+                    event_id=int(event["id"]),
+                    event_type=str(event["event_type"]),
+                    status=str(event["status"]),
+                    event_date=str(event["event_date"]),
+                    amount=event["amount"],
+                    currency=event["currency"],
+                    currency_source=event["currency_source"],
+                    item_name=event["item_name"],
+                    quantity=event["quantity"],
+                    unit=event["unit"],
+                    inventory_direction=event["inventory_direction"],
+                    description=event["description"],
+                    revision_number=int(event["current_revision_number"]),
+                    status_reason="missing_fields:" + ",".join(missing),
+                    now=now_iso,
                 )
-            repository.set_source_status(
-                connection,
-                source_message_id=source_message_id,
-                processing_status="pending",
-                now=now_iso,
+                if can_ask_again:
+                    requeued = repository.requeue_clarification_question(
+                        connection,
+                        clarification_id=clarification_id,
+                        question_text=messages.clarification_question(
+                            list(missing),
+                            prefix="برای تکمیل این مورد هنوز به این اطلاعات نیاز است:",
+                        ),
+                        missing_fields=list(missing),
+                        now=now_iso,
+                    )
+                else:
+                    requeued = repository.expire_clarification(
+                        connection, clarification_id=clarification_id, now=now_iso
+                    )
+                if not requeued:  # pragma: no cover - the claim above guarantees it
+                    raise RuntimeError(
+                        "clarification claim lost while reopening %s" % clarification_id
+                    )
+                repository.set_source_status(
+                    connection,
+                    source_message_id=source_message_id,
+                    processing_status="pending",
+                    now=now_iso,
+                )
+
+        if not claimed:
+            return self._reject_lost_answer(
+                clarification_id=clarification_id, source_message_id=source_message_id
             )
 
+        if unclear_notice:
+            # Only the answer that actually owns the clarification is told that it
+            # was not usable; a superseded answer stays silent.
+            self.notifier.send(
+                int(clarification["employee_telegram_user_id"]),
+                messages.CORRECTION_UNCLEAR,
+                kind="notice",
+            )
         if not can_ask_again:
             self.notifier.send(
                 int(clarification["employee_telegram_user_id"]),
