@@ -173,14 +173,35 @@ The owner reviews the results before production deployment.
 | G. cPanel and integrity | `test_integrity.py`, `test_migrations.py`, `test_config.py`, `test_decimal_time.py` | Local only; says nothing about the real account. |
 | I. Delivery integrity | `test_clarification_delivery.py`, `test_report_delivery_safety.py`, `test_migrations.py` | |
 | J. Lease fencing and reply resolution | `test_report_delivery_lease.py` (11), `test_clarification_reply_race.py` (19) | 30 tests added in the third pass |
+| K. Answer claim and state safety | `test_clarification_answer_claim.py` (27) | 27 tests added in the fourth pass; 16 of them fail on `93c1ca7` |
 | H. Human acceptance | — | Requires the owner's test group and a deployed instance. |
 
 ## Test evidence
 
-Arena reports (third pass, executed locally): `python3 -m pytest` → `325 passed in 8.07s`
-on Python 3.11.2 / SQLite 3.40.1. The second pass had left 295 passing tests; 30 were
-added and no existing test was modified. Nothing in section H was executed. No test
-reached Telegram, NVIDIA, cPanel or the accounting system — every external call is a fake.
+Arena reports (fourth pass, executed locally): `python3 -m pytest` → `352 passed in 8.66s`
+on Python 3.11.2 / SQLite 3.40.1; the same suite at the starting commit `93c1ca7` was
+`325 passed in 8.25s`. The third pass had left 325 passing tests; 27 were added in
+`tests/test_clarification_answer_claim.py` and no existing test was modified or relaxed.
+The concurrency cases use a `threading.Barrier` inside the AI call and the state cases
+use disposable rows — no test sleeps. Nothing in section H was executed. No test reached
+Telegram, NVIDIA, cPanel or the accounting system — every external call is a fake.
+
+Fourth-pass coverage in detail:
+- Two distinct valid answers, synchronized before the write: exactly one revision, exactly
+  one confirmation, one reply `processed`, the other `ignored`/`answer_claim_lost`.
+- A stale answer snapshot (the loser's view) applies nothing; duplicate `update_id` still
+  short-circuits before the model is called; a non-owner cannot claim or resolve.
+- Claim eligibility: `awaiting_answer`/`sending`/`delivery_uncertain` claimable,
+  `pending_delivery`/`resolved`/`expired`/`unable_to_deliver` not; a second claim is
+  refused; a released claim is claimable again.
+- Failure after the claim (revision write raises) rolls the claim back, leaves no revision
+  and no confirmation, and the next answer resolves normally; an AI failure before the
+  claim leaves the question answerable and the update retryable.
+- `delivery_uncertain` is rejected for `resolved`/`answered`/`expired`/`unable_to_deliver`,
+  for a stale worker after a takeover, and for every transition called without a worker
+  id; it still applies for the current lease owner.
+- The real bookkeeping-failure path preserves `resolved`/`expired`/`unable_to_deliver`,
+  sends nothing, and never resends; resolve/expire/requeue cannot rewrite `resolved`.
 
 OpenCode must later report:
 - Exact test commands.

@@ -24,6 +24,8 @@ Python 3.11.2 / SQLite 3.40.1. External calls use fakes; nothing reached the net
 | Webhook intake | HMAC-compared secret, size limit, duplicate `update_id` acknowledged once, no AI call in the request | `tests/test_webhook.py`, `tests/test_outbox.py` |
 | Authorization | Numeric IDs only; group allowlist; manager-only reports in private chat; correction ownership | `tests/test_authorization.py`, `tests/test_corrections.py` |
 | Clarification lifecycle | Claim before send; exactly one send under 4 concurrent workers; crash between send and bookkeeping does not resend; unknown outcome is `delivery_uncertain`, never resent, still answerable | `tests/test_clarification_delivery.py` (16 tests) |
+| Clarification answers | One conditional claim decides which answer may resolve a question: two concurrent valid answers produce one revision and one confirmation; the losing answer writes nothing; a failure after the claim rolls back; a released claim is reusable | `tests/test_clarification_answer_claim.py` (27 tests) |
+| Settled outcomes | `delivery_uncertain` applies only from `sending` by the current lease owner; `resolved`/`answered`/`expired`/`unable_to_deliver` are never rewritten; a rejected transition sends nothing and never resends; every owner-protected transition refuses `worker_id=None` | `tests/test_clarification_answer_claim.py` (27 tests) |
 | Immediate clarification reply | A reply that arrives before the question's message id is recorded is attributed to the employee's unconfirmed question and answered; the event is confirmed, the answer applied once, and a later bookkeeping commit changes nothing | `tests/test_clarification_reply_race.py` (19 tests) |
 | Report-delivery ownership | Progress, finalize and release are fenced by the lease owner in the same SQL statement; a stale worker stops, sends nothing further, and cannot clear the new owner's lease; settlement and exhaustion decisions require an expired lease | `tests/test_report_delivery_lease.py` (11 tests) |
 | Report delivery | Snapshot frozen before the first chunk; resume at the first unconfirmed chunk; no repeated chunk; unprovable outcome → `failed_uncertain` + one manager notice; lost snapshot never rebuilt | `tests/test_report_delivery_safety.py` (11 tests) |
@@ -33,9 +35,10 @@ Python 3.11.2 / SQLite 3.40.1. External calls use fakes; nothing reached the net
 | Integrity | Money as `Decimal`/TEXT, FK enforcement, `0600` file mode, WAL, secrets absent from repo and logs, declared Python 3.9 minimum enforced by AST parsing | `tests/test_integrity.py`, `tests/test_decimal_time.py` |
 | Operator visibility | `/health` → `review_needed` (counts); `doctor.py` → `delivery_review_needed` | `tests/test_integrity.py`, `tests/test_reports.py` |
 
-Full suite: `python3 -m pytest` → **325 passed in 8.07s** (250 at the end of the first
-pass, +45 in the second pass, +30 in the third pass; no existing test was modified). No lint/static tool is configured in this repository (no ruff/flake8/mypy
-config, no CI workflow); the checks actually executed are:
+Full suite: `python3 -m pytest` → **352 passed in 8.66s** (250 at the end of the first
+pass, +45 in the second pass, +30 in the third pass, +27 in the fourth pass; no existing
+test was modified or relaxed). No lint/static tool is configured in this repository (no
+ruff/flake8/mypy config, no CI workflow); the checks actually executed are:
 
 ```bash
 python3 -m pytest
@@ -262,14 +265,20 @@ deliberate.
    on-demand report's "which period?" prompt can hit the same window that clarifications
    now survive. It was deliberately left unchanged in the third pass; see
    `DECISIONS.md`.
-7. **Clock and timezone.** The schedule is correct only if the host has a working
+7. **One answer wins, the other is ignored.** Two valid answers to the same question are
+   no longer applied twice, but the superseded answer is silently dropped (source row
+   `ignored` / `answer_claim_lost`) rather than merged. This is the pre-existing product
+   rule — a question has exactly one authoritative answer — and the losing message is
+   still visible in the database for audit. If the owner ever wants conflicting answers
+   reconciled, that is a product change, not a defect.
+8. **Clock and timezone.** The schedule is correct only if the host has a working
    `Asia/Tehran` tz database; a missing tzdata makes startup fail rather than silently
    shifting the report.
-8. **Two-person review not performed.** A single agent pass, however many tests pass, is
+9. **Two-person review not performed.** A single agent pass, however many tests pass, is
    not a production-readiness claim.
-9. **Sections H (human acceptance) remains unexecuted.**
-10. **No lint/static analysis is configured** in the repository; adding one is a decision
-   for the owner, not a hidden step.
+10. **Sections H (human acceptance) remains unexecuted.**
+11. **No lint/static analysis is configured** in the repository; adding one is a decision
+    for the owner, not a hidden step.
 
 ---
 

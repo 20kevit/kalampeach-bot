@@ -2,6 +2,52 @@
 
 All notable project changes are recorded here.
 
+## [0.2.2] — Clarification answer claim and terminal-state protection (unreleased, not deployed)
+
+Fourth pass on `arena/c55428c7-kalampeach-bot`, starting at `93c1ca7`. Two narrow
+concurrency/state-safety defects found while reviewing that commit. Both were reproduced
+with executable scripts before being fixed. Same tables, same states, same message
+wording, no schema migration, no new dependency, no change to financials, classification
+or scheduling.
+
+### Fixed — one answer resolves one clarification (Issue 1)
+
+| Aspect | Verified defect at 93c1ca7 | Now |
+|---|---|---|
+| Answer ownership | `handle_answer` only *read* `clarification_accepts_answer` and then, after the AI call, wrote the revision and `clarifications.status` with `WHERE id = ?`. Two different valid answers from the same employee both passed the check and both resolved: reproduced as 2 clarification revisions, 2 confirmations, the first amount overwritten. | `repository.claim_clarification_answer` performs the check and the write in one conditional `UPDATE` filtered to `awaiting_answer`/`sending`/`delivery_uncertain`. The first commit moves the row to `answered`, which is not claimable, so exactly one answer can proceed. Verified with two workers synchronized by a `threading.Barrier` inside the AI call: 1 revision, 1 confirmation, one reply `processed`, the other `ignored`/`answer_claim_lost`. |
+| Atomicity of the apply | Revision, resolution and inbox status were separate statements around a read-then-write decision. | Claim, revision, event update, resolution, sibling-clarification closure and source status share one transaction. A failure after the claim rolls the claim back, so a clarification can never be left claimed-but-unanswered. |
+| Failure recovery | Not defined: an interruption between the state write and the revision was indistinguishable from success. | Normal recovery is the rollback (no claim survives). `release_clarification_answer_claim` exists for a caller that claimed and then deliberately gave up; it restores `awaiting_answer` (or `delivery_uncertain` when no question was ever confirmed) and only for the answer that owns the claim. |
+| Losing answer | Could write a second revision and a second confirmation. | Applies nothing: no revision, no event change, no confirmation, no `CORRECTION_UNCLEAR` notice. Its source row is recorded as `ignored` / `answer_claim_lost`. |
+| Incomplete answers | The same unfenced write decided requeue vs. expire, so two partial answers could both requeue. | `_expire_or_requeue` needs the same claim; the claim, the event note and the requeue/expire share one transaction. The requeue releases the claim (`response_source_message_id`/`answered_at_utc` cleared) so the next answer can claim normally. |
+| Unchanged semantics | — | Telegram `update_id` idempotency still short-circuits before any AI call; ownership and manager authorization are still checked first; sequential answers, retries, expiration and the two-times question limit behave exactly as before; `pending_delivery` and every terminal state remain unclaimable. |
+
+### Fixed — uncertainty recovery cannot rewrite a settled outcome (Issue 2)
+
+| Aspect | Verified defect at 93c1ca7 | Now |
+|---|---|---|
+| `mark_clarification_delivery_uncertain` | `worker_id=None` meant "skip the fence" and the statement only filtered `WHERE id`, so a resolved clarification became `delivery_uncertain` (reproduced for `resolved`, `answered`, `expired`, `unable_to_deliver`). | `worker_id` is required (`ValueError` otherwise) and the previous state must be `sending` with this worker as `lease_owner`, both inside the same `UPDATE`. No read-then-write. |
+| Recovery caller | `_mark_uncertain_after_success` passed no worker id at all. | Passes `self.ctx.worker_id` and checks the affected-row count: 0 means the transition was rejected, which is logged only — no resend, no second answer attempt, and the terminal state is preserved. |
+| Lease-owner bypass | Nine owner-protected transitions (`finish_update`, `schedule_update_retry`, the four clarification delivery transitions, and the three report-delivery transitions) accepted `worker_id=None` as "no fence". | All are fenced in SQL and require a worker id via `_require_worker`. Omitting the argument is a `TypeError`, passing `None`/`""` is a `ValueError`, and nothing is written. Takeover protection is unchanged. |
+| Late bookkeeping | `mark_clarification_resolved`, `expire_clarification` and `requeue_clarification_question` could rewrite any state, including `resolved`. | Each filters to non-terminal states inside its own `UPDATE` and returns the row count; `corrections._resolve_open_clarifications` reports a skipped row instead of forcing it. |
+
+### Verified locally (executed in this repository, not on the host)
+
+| Command | Result |
+|---|---|
+| `python3 -m pytest` (baseline, at 93c1ca7) | `325 passed in 8.25s` |
+| `python3 -m pytest` (after changes) | `352 passed in 8.66s` |
+| `python3 -m pytest tests/test_clarification_answer_claim.py` | `27 passed in 0.78s` |
+| Same test file against the 93c1ca7 tree | `16 failed, 11 passed` |
+| `/tmp/repro_answer_race.py` at 93c1ca7 | 2 revisions, 2 confirmations (defect present) |
+| `/tmp/repro_answer_race.py` after the fix | 1 revision, 1 confirmation, losing reply `ignored`/`answer_claim_lost` |
+| `/tmp/repro_uncertain_overwrite.py` at 93c1ca7 | `resolved` → `delivery_uncertain` (all terminal states rewritten) |
+| `python3 -m compileall -q kalampeach tests` | exit 0 |
+| `migrate.py --apply/--status`, `doctor.py`, `run_worker.py`, `backup_db.py` on a disposable DB | schema v2 `up to date`; doctor `0 failure(s), 0 warning(s)`; worker exit 0 with `schema_version: 2`; backup `integrity=ok` |
+| Schema-v2 DB created by the previous version, read by this version | `--status` reports both migrations applied, checksum unchanged; `integrity_check=ok`, `foreign_key_check` empty |
+
+Environment: Python 3.11.2, SQLite 3.40.1, pytest 9.2.0. No live Telegram, NVIDIA, cPanel
+or accounting-system call was made; every database was a disposable temporary file.
+
 ## [0.2.1] — Lease fencing and immediate-reply recovery (unreleased, not deployed)
 
 Third pass on `arena/c55428c7-kalampeach-bot`, starting at `234d134`. Two independently
