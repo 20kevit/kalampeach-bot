@@ -38,19 +38,21 @@ MAX_DELIVERY_ATTEMPTS = 3
 def clarification_accepts_answer(row, now_iso: str) -> bool:
     """Can an incoming message be treated as the answer to this question?
 
-    ``delivery_uncertain`` rows are accepted on purpose: the employee may have
-    received the question without the bot being able to prove it, so requiring
-    ``awaiting_answer`` would strand the event forever. A ``sending`` row is only
-    answerable once its claim has gone stale (the sending worker is gone).
+    ``awaiting_answer`` is the normal case. ``sending`` and ``delivery_uncertain``
+    are accepted on purpose: Telegram may already have delivered the question
+    while the local bookkeeping has not committed yet (or never will, if the
+    sending worker died). The employee can only reply to a question they actually
+    received, so rejecting those states would silently discard a valid answer.
+
+    Accepting a live ``sending`` row cannot produce two answers: the sending
+    worker's own transition is guarded by ``status = 'sending' AND lease_owner``,
+    so the answer wins and the sender simply does not re-apply its delivery state.
+
+    ``now_iso`` is kept for call-site compatibility and for callers that want to
+    reason about lease freshness; it no longer gates acceptance.
     """
 
-    status = str(row["status"])
-    if status in ("awaiting_answer", "delivery_uncertain"):
-        return True
-    if status == "sending":
-        expiry = row["lease_expires_at_utc"]
-        return expiry is None or str(expiry) <= now_iso
-    return False
+    return str(row["status"]) in ("awaiting_answer", "sending", "delivery_uncertain")
 
 
 class CaptureService:
@@ -282,25 +284,30 @@ class CaptureService:
                     question_count=question_count,
                     worker_id=self.ctx.worker_id,
                 )
-                if changed:
-                    repository.record_bot_message(
-                        connection,
-                        chat_id=employee_id,
-                        message_id=int(message_id),
-                        kind="clarification_prompt",
-                        event_id=int(row["event_id"]),
-                        clarification_id=clarification_id,
-                        now=now_iso,
-                    )
+                # The message definitively exists in Telegram, so its id is always
+                # recorded — even if the state transition above lost a race. That
+                # keeps later replies resolvable through the normal mapping path.
+                repository.record_bot_message(
+                    connection,
+                    chat_id=employee_id,
+                    message_id=int(message_id),
+                    kind="clarification_prompt",
+                    event_id=int(row["event_id"]),
+                    clarification_id=clarification_id,
+                    now=now_iso,
+                )
         except Exception as exc:  # bookkeeping failed after a confirmed send
             self._mark_uncertain_after_success(clarification_id, exc)
             return "uncertain"
 
-        if not changed:  # pragma: no cover - claim lost between send and record
-            logger.error(
-                "clarification_delivery_claim_lost clarification_id=%s", clarification_id
+        if not changed:
+            # Not an unknown outcome: the row moved on while we were sending, most
+            # often because the employee answered the question immediately.
+            logger.info(
+                "clarification_delivered_after_state_change clarification_id=%s",
+                clarification_id,
             )
-            return "uncertain"
+            return "answered_during_send"
 
         logger.info(
             "clarification_sent clarification_id=%s event_id=%s",

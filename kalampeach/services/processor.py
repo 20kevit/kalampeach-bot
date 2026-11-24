@@ -213,6 +213,41 @@ class MessageProcessor:
 
             source = repository.get_source_message_by_telegram(connection, chat_id, reply_to)
             if source is None:
+                # The quoted message is unknown to us. That is exactly what a reply
+                # to a clarification question looks like in the window between
+                # Telegram accepting the send and the local mapping being committed
+                # (or forever, if the sending worker died before recording it).
+                # A question in ``sending``/``delivery_uncertain`` is durable proof
+                # that such a message may exist, so attribute the reply to it when
+                # there is exactly one such question for this sender.
+                # Questions are only ever sent to an employee's private chat, so
+                # only a private reply from that same numeric id may be attributed;
+                # a group reply is left unresolved rather than guessed.
+                private_reply = (
+                    message.chat_type == "private"
+                    and int(message.chat_id) == int(message.sender_id or 0)
+                )
+                unresolved = (
+                    repository.find_unconfirmed_clarifications(
+                        connection, employee_telegram_user_id=int(message.sender_id or 0)
+                    )
+                    if private_reply
+                    else []
+                )
+                if len(unresolved) == 1:
+                    logger.info(
+                        "reply_attributed_to_unconfirmed_clarification clarification_id=%s"
+                        " update_id=%s",
+                        int(unresolved[0]["id"]),
+                        message.update_id,
+                    )
+                    return "clarification", unresolved[0]
+                if len(unresolved) > 1:
+                    logger.warning(
+                        "reply_target_ambiguous_unconfirmed_clarifications count=%d update_id=%s",
+                        len(unresolved),
+                        message.update_id,
+                    )
                 return "unresolved", None
 
             candidates = []

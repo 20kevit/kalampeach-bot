@@ -934,6 +934,34 @@ def list_open_clarifications(
     ).fetchall()
 
 
+# Clarifications whose delivery was attempted but never confirmed. They are the
+# durable evidence that a question may be in an employee's hands without a local
+# message mapping (see MessageProcessor._resolve_reply_target).
+UNCONFIRMED_CLARIFICATION_STATES = ("sending", "delivery_uncertain")
+
+
+def find_unconfirmed_clarifications(
+    connection: sqlite3.Connection, *, employee_telegram_user_id: int
+) -> List[sqlite3.Row]:
+    """Questions for this employee whose message id was never recorded.
+
+    A question reaches ``sending`` immediately before the Telegram call and
+    ``delivery_uncertain`` when the send outcome is unknown, so both states prove
+    that the bot tried to deliver a question to this employee and cannot say for
+    certain which chat message it became.
+    """
+
+    return connection.execute(
+        """
+        SELECT * FROM clarifications
+         WHERE employee_telegram_user_id = ?
+           AND status IN ('sending', 'delivery_uncertain')
+         ORDER BY id
+        """,
+        (employee_telegram_user_id,),
+    ).fetchall()
+
+
 def count_clarifications_in_status(connection: sqlite3.Connection, status: str) -> int:
     row = connection.execute(
         "SELECT COUNT(*) AS total FROM clarifications WHERE status = ?", (status,)
